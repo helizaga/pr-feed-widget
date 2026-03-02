@@ -9,8 +9,9 @@ struct KnownEditor: Identifiable {
     let isTerminal: Bool
 
     var isInstalled: Bool {
-        if let bundleId = bundleId {
-            return NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleId) != nil
+        if let bundleId = bundleId,
+           NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleId) != nil {
+            return true
         }
         if let cli = cliCommand {
             return Self.commandExists(cli)
@@ -29,6 +30,12 @@ struct KnownEditor: Identifiable {
         task.arguments = [name]
         task.standardOutput = FileHandle.nullDevice
         task.standardError = FileHandle.nullDevice
+        // macOS GUI apps have a minimal PATH; add common install locations
+        var env = ProcessInfo.processInfo.environment
+        let extraPaths = ["/opt/homebrew/bin", "/usr/local/bin"]
+        let currentPath = env["PATH"] ?? "/usr/bin:/bin:/usr/sbin:/sbin"
+        env["PATH"] = (extraPaths + [currentPath]).joined(separator: ":")
+        task.environment = env
         do {
             try task.run()
             task.waitUntilExit()
@@ -99,7 +106,12 @@ class EditorManager: ObservableObject {
     }
 
     private func saveEditorToConfig(_ editorId: String?) {
-        guard var content = try? String(contentsOfFile: configPath, encoding: .utf8) else { return }
+        let configURL = URL(fileURLWithPath: configPath)
+        try? FileManager.default.createDirectory(
+            at: configURL.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        var content = (try? String(contentsOf: configURL, encoding: .utf8)) ?? ""
 
         // Remove existing editor line (commented or not)
         let lines = content.components(separatedBy: "\n")
@@ -124,10 +136,13 @@ class EditorManager: ObservableObject {
 
         // Append the editor setting
         if let editorId = editorId {
-            content += "\n# IDE for opening review clones\nide: \(editorId)\n"
+            let escaped = editorId
+                .replacingOccurrences(of: "\\", with: "\\\\")
+                .replacingOccurrences(of: "\"", with: "\\\"")
+            content += "\n# IDE for opening review clones\nide: \"\(escaped)\"\n"
         }
 
-        try? content.write(toFile: configPath, atomically: true, encoding: .utf8)
+        try? content.write(to: configURL, atomically: true, encoding: .utf8)
     }
 
     // MARK: - Opening

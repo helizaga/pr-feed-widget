@@ -86,6 +86,7 @@ _log "Starting review"
 
 # --- Set up git worktree from user's local repo for full code access ---
 local_repo=$(_config_repo_path "$repo")
+local_repo="${local_repo/#\~/$HOME}"
 review_worktree="$reviews_dir/$repo/pr-$pr_num"
 
 if [[ -n "$local_repo" ]] && [[ -d "$local_repo/.git" ]]; then

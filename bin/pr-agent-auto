@@ -33,7 +33,15 @@ monitor_interval=$(_config_value "auto_monitor_interval")
 monitor_interval="${monitor_interval:-300}"
 max_responses=$(_config_value "auto_max_responses")
 max_responses="${max_responses:-10}"
-response_count=0
+response_count=$(python3 -c "
+import json
+try:
+    with open('$session_dir/meta.json') as f:
+        m = json.load(f)
+    print(int(m.get('auto_response_count', 0)))
+except Exception:
+    print(0)
+")
 
 _log "Starting auto-monitor (interval: ${monitor_interval}s, max responses: $max_responses)"
 
@@ -108,7 +116,6 @@ with open('$session_dir/meta.json', 'w') as f:
     fi
 
     _log "Found $comment_count new comments — responding"
-    response_count=$((response_count + 1))
 
     # Update status
     _update_meta_status "$session_dir" "auto-responding"
@@ -155,9 +162,9 @@ Please review these new comments and respond appropriately. If they raise valid 
         if [[ -f "$session_dir/response-${response_count}.md" ]]; then
             if gh pr comment "$pr_url" --body-file "$session_dir/response-${response_count}.md" 2>/dev/null; then
                 post_succeeded=true
+                response_count=$((response_count + 1))
             else
                 _log "Failed to post response comment"
-                response_count=$((response_count - 1))  # don't count failed posts
             fi
         fi
     else

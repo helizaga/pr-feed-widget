@@ -470,7 +470,7 @@ cmd_re_review() {
         return 1
     fi
 
-    local session_id review_clone pr_key repo pr_num pr_url title author org
+    local session_id review_clone pr_key repo pr_num pr_url title author org backend
     session_id=$(_meta_field "$session_dir" "session_id")
     review_clone=$(_meta_field "$session_dir" "review_clone")
     pr_key=$(_meta_field "$session_dir" "pr_key")
@@ -480,6 +480,14 @@ cmd_re_review() {
     title=$(_meta_field "$session_dir" "title")
     author=$(_meta_field "$session_dir" "author")
     org=$(_meta_field "$session_dir" "org")
+    backend=$(_meta_field "$session_dir" "backend")
+    backend="${backend:-claude}"
+
+    if [[ "$backend" != "claude" ]]; then
+        echo "This session used the '$backend' backend which doesn't support resume/re-review."
+        echo "Use 'pr-agent review $ref' for a fresh review."
+        return 1
+    fi
 
     if [[ -z "$session_id" ]] || [[ "$session_id" == "None" ]]; then
         echo "No session ID found — review may not have completed. Use 'pr-agent review' for a fresh review."

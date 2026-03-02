@@ -297,6 +297,11 @@ Update your review assessment if needed."""
     # Wait in a separate thread (lock released, so other operations can proceed)
     def _wait():
         rc = proc.wait()
+        # Close file handles now that the subprocess has exited
+        if out_file:
+            out_file.close()
+        if err_file:
+            err_file.close()
         with lock:
             try:
                 with open(meta_file) as f:
@@ -334,7 +339,13 @@ class WebhookHandler(BaseHTTPRequestHandler):
             return
 
         MAX_PAYLOAD = 10 * 1024 * 1024  # 10 MB
-        content_length = int(self.headers.get("Content-Length", 0))
+        try:
+            content_length = int(self.headers.get("Content-Length", 0))
+        except (TypeError, ValueError):
+            self.send_response(400)
+            self.end_headers()
+            self.wfile.write(b"Invalid Content-Length")
+            return
         if content_length == 0:
             self.send_response(400)
             self.end_headers()
