@@ -64,8 +64,7 @@ private func runGH(_ arguments: [String]) -> String {
     } catch {
         return ""
     }
-    // Read pipe BEFORE waitUntilExit — if gh output exceeds the 64KB kernel
-    // pipe buffer (e.g. paginated org repos), both sides deadlock otherwise.
+    // Read pipe before waitUntilExit to avoid deadlock on large output
     let data = pipe.fileHandleForReading.readDataToEndOfFile()
     task.waitUntilExit()
     return String(data: data, encoding: .utf8) ?? ""

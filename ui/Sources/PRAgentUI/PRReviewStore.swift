@@ -257,9 +257,7 @@ class PRReviewStore: ObservableObject {
             return nil
         }
 
-        // Read pipe BEFORE waitUntilExit to avoid deadlock when output
-        // exceeds the 64KB kernel pipe buffer (ps output can be >150KB
-        // with many running processes).
+        // Read pipe before waitUntilExit to avoid deadlock on large output
         let output = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
         task.waitUntilExit()
 
