@@ -1,0 +1,185 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+PR_AGENT_HOME="${PR_AGENT_HOME:-$HOME/.pr-agent}"
+PR_AGENT_DIR="$(cd "$(dirname "$(readlink -f "$0" 2>/dev/null || realpath "$0" 2>/dev/null || echo "$0")")/.." && pwd)"
+CONFIG_FILE="$PR_AGENT_HOME/config.yaml"
+SESSIONS_DIR="$PR_AGENT_HOME/sessions"
+SLACK_STATE_FILE="$PR_AGENT_HOME/slack-state.json"
+LOG_FILE="$PR_AGENT_HOME/slack.log"
+
+source "$PR_AGENT_DIR/bin/lib-config.sh"
+
+mkdir -p "$SESSIONS_DIR"
+
+_log() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [slack] $*" | tee -a "$LOG_FILE"
+}
+
+# Initialize slack state file if missing
+if [[ ! -f "$SLACK_STATE_FILE" ]]; then
+    echo '{"processed_messages": {}, "last_poll": null}' > "$SLACK_STATE_FILE"
+fi
+
+# Read Slack config
+slack_channel=$(_config_value "slack_channel")
+slack_bot_token=$(_config_value "slack_bot_token")
+trigger_emoji=$(_config_value "slack_trigger_emoji")
+trigger_emoji="${trigger_emoji:-rocket}"
+target_repo=$(_config_value "slack_target_repo")
+
+if [[ -z "$slack_channel" ]]; then
+    _log "ERROR: slack_channel not set in config"
+    exit 1
+fi
+
+if [[ -z "$slack_bot_token" ]]; then
+    _log "ERROR: slack_bot_token not set in config"
+    exit 1
+fi
+
+if [[ -z "$target_repo" ]]; then
+    _log "ERROR: slack_target_repo not set in config"
+    exit 1
+fi
+
+_is_processed() {
+    local msg_key="$1"
+    python3 -c "
+import json
+with open('$SLACK_STATE_FILE') as f:
+    s = json.load(f)
+print('yes' if '$msg_key' in s.get('processed_messages', {}) else 'no')
+"
+}
+
+_mark_processed() {
+    local msg_key="$1"
+    python3 -c "
+import json
+from datetime import datetime, timezone
+with open('$SLACK_STATE_FILE') as f:
+    s = json.load(f)
+s.setdefault('processed_messages', {})['$msg_key'] = datetime.now(timezone.utc).isoformat()
+s['last_poll'] = datetime.now(timezone.utc).isoformat()
+with open('$SLACK_STATE_FILE', 'w') as f:
+    json.dump(s, f, indent=2)
+"
+}
+
+_update_last_poll() {
+    python3 -c "
+import json
+from datetime import datetime, timezone
+with open('$SLACK_STATE_FILE') as f:
+    s = json.load(f)
+s['last_poll'] = datetime.now(timezone.utc).isoformat()
+with open('$SLACK_STATE_FILE', 'w') as f:
+    json.dump(s, f, indent=2)
+"
+}
+
+# --- Main poll cycle ---
+
+_log "Slack poll cycle starting (channel: $slack_channel, emoji: $trigger_emoji)"
+
+# Fetch recent messages from channel
+messages_json=$(curl -s -H "Authorization: Bearer $slack_bot_token" \
+    "https://slack.com/api/conversations.history?channel=${slack_channel}&limit=50" 2>&1) || {
+    _log "ERROR: Failed to fetch Slack messages"
+    exit 1
+}
+
+# Check for API errors
+ok=$(echo "$messages_json" | python3 -c "import sys,json; print(json.load(sys.stdin).get('ok', False))")
+if [[ "$ok" != "True" ]]; then
+    error=$(echo "$messages_json" | python3 -c "import sys,json; print(json.load(sys.stdin).get('error', 'unknown'))")
+    _log "ERROR: Slack API error: $error"
+    exit 1
+fi
+
+# Parse messages and check for trigger emoji reactions
+new_count=0
+
+# Write triggered messages to a temp file to avoid subshell variable scoping
+triggered_file=$(mktemp)
+echo "$messages_json" | python3 -c "
+import sys, json
+
+data = json.load(sys.stdin)
+messages = data.get('messages', [])
+
+for msg in messages:
+    ts = msg.get('ts', '')
+    text = msg.get('text', '')
+    user = msg.get('user', 'unknown')
+    reactions = msg.get('reactions', [])
+
+    # Check if this message has the trigger emoji
+    has_trigger = False
+    for r in reactions:
+        if r.get('name', '') == '$trigger_emoji':
+            has_trigger = True
+            break
+
+    if has_trigger and text.strip():
+        # Escape for bash: replace newlines with \\\\n, pipes with placeholder
+        safe_text = text.replace('\\\\', '\\\\\\\\').replace('|', '__PIPE__').replace('\\n', '\\\\n')
+        print(f'{ts}|{user}|{safe_text}')
+" > "$triggered_file"
+
+# Read config for concurrency limit
+max_concurrent=$(_config_value "max_concurrent_reviews")
+max_concurrent="${max_concurrent:-2}"
+
+while IFS='|' read -r msg_ts msg_user msg_text; do
+    [[ -z "$msg_ts" ]] && continue
+
+    msg_key="${slack_channel}-${msg_ts}"
+
+    if [[ "$(_is_processed "$msg_key")" == "yes" ]]; then
+        continue
+    fi
+
+    # Check concurrency limit before spawning
+    active=$(_count_active_reviews)
+    if (( active >= max_concurrent )); then
+        _log "Concurrency limit ($max_concurrent) reached, skipping $msg_key"
+        continue
+    fi
+
+    # Restore pipe characters in message text
+    msg_text="${msg_text//__PIPE__/|}"
+
+    _log "New triggered message: $msg_key (from $msg_user)"
+
+    # Resolve Slack user ID to display name
+    author="$msg_user"
+    user_info=$(curl -s -H "Authorization: Bearer $slack_bot_token" \
+        "https://slack.com/api/users.info?user=${msg_user}" 2>/dev/null) || true
+    resolved_name=$(echo "$user_info" | python3 -c "
+import sys, json
+try:
+    data = json.load(sys.stdin)
+    profile = data.get('user', {}).get('profile', {})
+    name = profile.get('display_name') or profile.get('real_name') or data.get('user', {}).get('name', '')
+    print(name)
+except:
+    print('')
+" 2>/dev/null) || true
+    if [[ -n "$resolved_name" ]]; then
+        author="$resolved_name"
+    fi
+
+    _mark_processed "$msg_key"
+
+    # Spawn the implementation review
+    _log "Spawning implementation agent for message $msg_key"
+    "$PR_AGENT_DIR/bin/pr-agent-slack-review" "$msg_key" "$slack_channel" "$msg_text" "$author" "$target_repo" &
+
+    new_count=$((new_count + 1))
+done < "$triggered_file"
+rm -f "$triggered_file"
+
+_update_last_poll
+_log "Slack poll cycle complete (found $new_count new messages)"

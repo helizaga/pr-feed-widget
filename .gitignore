@@ -1,0 +1,20 @@
+# Runtime state
+state.json
+sessions/
+
+# macOS
+.DS_Store
+*.swp
+
+# Swift build
+.build/
+build/
+*.xcodeproj
+*.xcworkspace
+DerivedData/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+.claude/worktrees/

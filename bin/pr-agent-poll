@@ -1,0 +1,324 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+PR_AGENT_HOME="${PR_AGENT_HOME:-$HOME/.pr-agent}"
+PR_AGENT_DIR="$(cd "$(dirname "$(readlink -f "$0" 2>/dev/null || realpath "$0" 2>/dev/null || echo "$0")")/.." && pwd)"
+CONFIG_FILE="$PR_AGENT_HOME/config.yaml"
+STATE_FILE="$PR_AGENT_HOME/state.json"
+SESSIONS_DIR="$PR_AGENT_HOME/sessions"
+LOG_FILE="$PR_AGENT_HOME/poll.log"
+
+source "$PR_AGENT_DIR/bin/lib-config.sh"
+
+_log() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a "$LOG_FILE"
+}
+
+# _count_active_reviews is defined in lib-config.sh
+
+# Re-spawn a dead review session in the background
+_respawn_review() {
+    local session_dir="$1"
+    local pr_key pr_url title repo pr_num author created_at
+    pr_key=$(basename "$session_dir")
+    pr_url=$(_meta_field "$session_dir" "pr_url" 2>/dev/null || echo "")
+    title=$(_meta_field "$session_dir" "title" 2>/dev/null || echo "")
+    repo=$(_meta_field "$session_dir" "repo" 2>/dev/null || echo "")
+    pr_num=$(_meta_field "$session_dir" "pr_number" 2>/dev/null || echo "")
+    author=$(_meta_field "$session_dir" "author" 2>/dev/null || echo "")
+    created_at=$(_meta_field "$session_dir" "created_at" 2>/dev/null || echo "")
+
+    if [[ -z "$pr_url" ]] || [[ -z "$repo" ]] || [[ -z "$pr_num" ]]; then
+        _log "Cannot respawn $(basename "$session_dir") — missing metadata, marking failed"
+        _update_meta_status "$session_dir" "failed"
+        return
+    fi
+
+    # Clean up stale session artifacts so pr-agent-review starts fresh
+    rm -f "$session_dir/review.md" "$session_dir/comments.json" "$session_dir/claude-stderr.log"
+
+    _log "Re-spawning review for ${repo}#${pr_num}"
+    "$PR_AGENT_DIR/bin/pr-agent-review" "$pr_key" "$pr_url" "$title" "$repo" "$pr_num" "$author" "$created_at" &
+}
+
+# --- Main poll cycle ---
+
+# Detect zombie sessions (reviewing but process is dead) and re-spawn them
+# Respects the same concurrency limit as new reviews
+_log "Checking for zombie sessions"
+max_concurrent=$(_config_value "max_concurrent_reviews")
+max_concurrent="${max_concurrent:-2}"
+respawn_count=0
+
+for session_dir in "$SESSIONS_DIR"/*/; do
+    [[ -f "$session_dir/meta.json" ]] || continue
+    sess_status=$(_meta_field "$session_dir" "status" 2>/dev/null || echo "")
+
+    # Only check statuses that imply a running process
+    case "$sess_status" in
+        reviewing) ;;
+        *) continue ;;
+    esac
+
+    pid=$(_meta_field "$session_dir" "pid" 2>/dev/null || echo "")
+    if [[ -n "$pid" ]] && [[ "$pid" != "None" ]] && kill -0 "$pid" 2>/dev/null; then
+        continue  # Process is alive, all good
+    fi
+
+    # Check concurrency before re-spawning
+    active=$(_count_active_reviews)
+    if (( active >= max_concurrent )); then
+        _log "Zombie detected: $(basename "$session_dir") — deferring (concurrency limit $max_concurrent reached)"
+        continue
+    fi
+
+    _log "Zombie detected: $(basename "$session_dir") (status=$sess_status, pid=$pid dead)"
+    _respawn_review "$session_dir"
+    respawn_count=$((respawn_count + 1))
+done
+if (( respawn_count > 0 )); then
+    _log "Re-spawned $respawn_count zombie sessions"
+fi
+
+_log "Poll cycle starting"
+
+org=$(_config_value "github_org")
+
+if [[ -z "$org" ]]; then
+    _log "ERROR: github_org not set in config"
+    exit 1
+fi
+
+_log "Fetching all open PRs for org: $org"
+
+# List all org repos, then fetch open PRs per-repo via REST API (no result cap)
+repos_list=""
+page=1
+while true; do
+    page_results=$(gh api "orgs/${org}/repos?per_page=100&type=all&page=${page}" \
+        --jq '.[].name' 2>&1) || {
+        _log "ERROR: Failed to list repos (page $page): $page_results"
+        break
+    }
+    [[ -z "$page_results" ]] && break
+    if [[ -n "$repos_list" ]]; then
+        repos_list="$repos_list"$'\n'"$page_results"
+    else
+        repos_list="$page_results"
+    fi
+    page_count=$(echo "$page_results" | wc -l | tr -d ' ')
+    page=$(( page + 1 ))
+    (( page_count < 100 )) && break
+done
+
+repo_count=$(echo "$repos_list" | wc -l | tr -d ' ')
+_log "Found $repo_count repos in $org"
+
+# Fetch open PRs across all repos in parallel (10 concurrent gh api calls)
+pr_tmpdir=$(mktemp -d)
+trap "rm -rf '$pr_tmpdir'" EXIT
+
+_fetch_repo_prs() {
+    local repo="$1" org="$2" outfile="$3"
+    local pr_page=1
+    while true; do
+        page_results=$(gh api "repos/${org}/${repo}/pulls?state=open&per_page=100&page=${pr_page}" \
+            --jq '.[] | "\(.number)|https://api.github.com/repos/'"${org}"'/'"${repo}"'|\(.title)|\(.html_url)|\(.created_at)|\(.user.login)|\(.draft)"' 2>/dev/null) || {
+            _log "WARNING: Failed to fetch PRs for ${repo} (page ${pr_page})"
+            break
+        }
+        [[ -z "$page_results" ]] && break
+        echo "$page_results" >> "$outfile"
+        page_count=$(echo "$page_results" | wc -l | tr -d ' ')
+        pr_page=$(( pr_page + 1 ))
+        (( page_count < 100 )) && break
+    done
+}
+
+# Build list of non-skipped repos
+filtered_repos=()
+while IFS= read -r repo; do
+    [[ -z "$repo" ]] && continue
+    [[ "$(_is_skip_repo "$repo")" == "yes" ]] && continue
+    filtered_repos+=("$repo")
+done <<< "$repos_list"
+
+# Fetch PRs in parallel (batches of 10, per-repo output files to avoid races)
+parallel_limit=10
+job_count=0
+for repo in "${filtered_repos[@]+"${filtered_repos[@]}"}"; do
+    _fetch_repo_prs "$repo" "$org" "$pr_tmpdir/$repo" &
+    job_count=$((job_count + 1))
+    if (( job_count >= parallel_limit )); then
+        wait
+        job_count=0
+    fi
+done
+wait
+
+prs=""
+if ls "$pr_tmpdir"/* >/dev/null 2>&1; then
+    prs=$(cat "$pr_tmpdir"/*)
+fi
+fetched=$(echo "$prs" | grep -c . || true)
+
+_log "Fetched $fetched open PRs across ${#filtered_repos[@]} repos"
+
+if [[ -z "$prs" ]]; then
+    _log "No open PRs found"
+    exit 0
+fi
+
+new_count=0
+queued=()
+
+skip_drafts=$(_config_bool "skip_drafts" "true")
+
+# Load all seen PR keys once (avoids spawning python3 per-PR)
+seen_prs=""
+if [[ -f "$STATE_FILE" ]]; then
+    seen_prs=$(python3 -c "import json; print('\n'.join(json.load(open('$STATE_FILE')).get('seen_prs', {}).keys()))" 2>/dev/null || echo "")
+fi
+
+while IFS='|' read -r pr_num repo_url title pr_url created_at author draft; do
+    [[ -z "$pr_num" ]] && continue
+
+    # Extract repo name from URL
+    repo=$(echo "$repo_url" | sed 's|.*/||')
+
+    if [[ "$(_is_skip_repo "$repo")" == "yes" ]]; then
+        continue
+    fi
+
+    # Skip draft PRs unless configured otherwise
+    if [[ "$skip_drafts" == "true" ]] && [[ "$draft" == "true" ]]; then
+        continue
+    fi
+
+    pr_key="${org}-${repo}-${pr_num}"
+
+    if echo "$seen_prs" | grep -qxF "$pr_key"; then
+        continue
+    fi
+
+    _log "New PR found: ${repo}#${pr_num} - ${title} (by ${author})"
+    queued+=("${pr_key}|${pr_url}|${title}|${repo}|${pr_num}|${author}|${created_at}")
+    new_count=$((new_count + 1))
+
+done <<< "$prs"
+
+_log "Found $new_count new PRs"
+
+# Sort queued PRs newest-first by created_at (field 7)
+# This ensures recent PRs are reviewed first; new PRs from webhooks
+# naturally jump the queue since they'll have the most recent dates
+if (( ${#queued[@]} > 1 )); then
+    sorted=$(printf '%s\n' "${queued[@]}" | sort -t'|' -k7 -r)
+    queued=()
+    while IFS= read -r line; do
+        [[ -n "$line" ]] && queued+=("$line")
+    done <<< "$sorted"
+fi
+
+# Spawn reviews with concurrency limit (max_concurrent set above in zombie section)
+review_pids=()
+
+for entry in "${queued[@]+"${queued[@]}"}"; do
+    IFS='|' read -r pr_key pr_url title repo pr_num author created_at <<< "$entry"
+
+    # Wait until we're under the concurrency limit
+    # Uses _count_active_reviews to count ALL active reviews globally
+    # (including zombie re-spawns and webhook-triggered reviews)
+    while true; do
+        running=$(_count_active_reviews)
+        if (( running < max_concurrent )); then
+            break
+        fi
+        _log "Concurrency limit ($max_concurrent) reached, waiting... ($running active)"
+        sleep 5
+    done
+
+    _mark_seen "$pr_key"
+
+    # Check if this author qualifies for auto-mode
+    auto_mode="false"
+    if [[ "$(_config_list_contains "auto_review_users" "$author")" == "yes" ]]; then
+        auto_mode="true"
+        _log "Auto-mode enabled for ${repo}#${pr_num} (author: $author)"
+    fi
+
+    # Pre-set auto_mode in a temp file the review script will read
+    if [[ "$auto_mode" == "true" ]]; then
+        mkdir -p "$SESSIONS_DIR/$pr_key"
+        echo "$auto_mode" > "$SESSIONS_DIR/$pr_key/.auto_mode"
+    fi
+
+    _log "Spawning review for ${repo}#${pr_num} ($(( ${#review_pids[@]} + 1 ))/${#queued[@]})"
+    "$PR_AGENT_DIR/bin/pr-agent-review" "$pr_key" "$pr_url" "$title" "$repo" "$pr_num" "$author" "$created_at" &
+    review_pids+=($!)
+done
+
+# Wait for remaining reviews to finish
+for pid in "${review_pids[@]+"${review_pids[@]}"}"; do
+    wait "$pid" 2>/dev/null || true
+done
+
+# --- Merge check pass ---
+_log "Checking for merged PRs"
+merge_checked=0
+for session_dir in "$SESSIONS_DIR"/*/; do
+    [[ -f "$session_dir/meta.json" ]] || continue
+
+    status=$(_meta_field "$session_dir" "status" 2>/dev/null || echo "")
+
+    # Skip already-merged, failed, or actively reviewing sessions
+    case "$status" in
+        merged|failed|reviewing|waiting-coderabbit) continue ;;
+    esac
+
+    # Rate limit: only check each PR once per hour
+    last_merge_check=$(_meta_field "$session_dir" "merge_checked_at" 2>/dev/null || echo "")
+    if [[ -n "$last_merge_check" ]]; then
+        seconds_since=$(python3 -c "
+from datetime import datetime, timezone
+last = datetime.fromisoformat('$last_merge_check')
+now = datetime.now(timezone.utc)
+print(int((now - last).total_seconds()))
+" 2>/dev/null || echo "0")
+        if (( seconds_since < 3600 )); then
+            continue
+        fi
+    fi
+
+    pr_key=$(basename "$session_dir")
+    pr_org=$(_meta_field "$session_dir" "org" 2>/dev/null || echo "$org")
+    repo_name=$(_meta_field "$session_dir" "repo" 2>/dev/null || echo "")
+    pr_num=$(_meta_field "$session_dir" "pr_number" 2>/dev/null || echo "")
+
+    [[ -z "$repo_name" || -z "$pr_num" ]] && continue
+
+    # Check PR state via GitHub API (single call)
+    pr_info=$(gh api "repos/${pr_org}/${repo_name}/pulls/${pr_num}" --jq '{state,merged,merged_at}' 2>/dev/null || echo '{}')
+    pr_state=$(echo "$pr_info" | python3 -c "import json,sys; print(json.load(sys.stdin).get('state',''))" 2>/dev/null || echo "")
+    pr_merged=$(echo "$pr_info" | python3 -c "import json,sys; print(str(json.load(sys.stdin).get('merged',False)).lower())" 2>/dev/null || echo "false")
+
+    # Update merge_checked_at regardless
+    _update_meta_field "$session_dir" "merge_checked_at" "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+    if [[ "$pr_merged" == "true" ]]; then
+        _log "PR merged: ${repo_name}#${pr_num}"
+        _update_meta_status "$session_dir" "merged"
+        merged_at=$(echo "$pr_info" | python3 -c "import json,sys; print(json.load(sys.stdin).get('merged_at',''))" 2>/dev/null || echo "")
+        if [[ -n "$merged_at" ]]; then
+            _update_meta_field "$session_dir" "merged_at" "$merged_at"
+        fi
+        merge_checked=$((merge_checked + 1))
+    elif [[ "$pr_state" == "closed" ]]; then
+        _log "PR closed (not merged): ${repo_name}#${pr_num}"
+        _update_meta_status "$session_dir" "dismissed"
+    fi
+done
+
+_log "Merge check complete ($merge_checked PRs merged)"
+
+_log "Poll cycle complete"

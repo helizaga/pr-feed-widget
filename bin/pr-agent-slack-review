@@ -1,0 +1,238 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+PR_AGENT_HOME="${PR_AGENT_HOME:-$HOME/.pr-agent}"
+PR_AGENT_DIR="$(cd "$(dirname "$(readlink -f "$0" 2>/dev/null || realpath "$0" 2>/dev/null || echo "$0")")/.." && pwd)"
+CONFIG_FILE="$PR_AGENT_HOME/config.yaml"
+SESSIONS_DIR="$PR_AGENT_HOME/sessions"
+LOG_FILE="$PR_AGENT_HOME/slack.log"
+
+source "$PR_AGENT_DIR/bin/lib-config.sh"
+
+msg_key="$1"      # channel-timestamp
+channel_id="$2"   # Slack channel ID
+msg_text="$3"     # Message text (newlines escaped as \n)
+author="$4"       # Slack username/display name
+target_repo="$5"  # owner/repo format
+
+# Unescape newlines
+msg_text="${msg_text//\\n/$'\n'}"
+
+# Extract repo owner and name
+repo_owner="${target_repo%%/*}"
+repo_name="${target_repo##*/}"
+
+session_key="slack-${msg_key}"
+session_dir="$SESSIONS_DIR/$session_key"
+mkdir -p "$session_dir"
+
+_log() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [slack-review:${session_key}] $*" | tee -a "$LOG_FILE"
+}
+
+_notify() {
+    local ntitle="$1" message="$2"
+    osascript -e "display notification \"$message\" with title \"$ntitle\"" 2>/dev/null || true
+}
+
+# Build a short title from the first 80 chars of the message
+short_title=$(echo "$msg_text" | head -1 | cut -c1-80)
+
+# Write initial meta.json — pipe user-derived values through stdin to avoid injection
+python3 -c "
+import json, sys
+from datetime import datetime, timezone
+# Read user-derived values from stdin (one per line, JSON-encoded)
+lines = sys.stdin.read().strip().split('\n')
+title_val = json.loads(lines[0])
+author_val = json.loads(lines[1])
+message_val = json.loads(lines[2])
+meta = {
+    'pr_key': '$session_key',
+    'pr_url': '',
+    'pr_number': 0,
+    'repo': '$repo_name',
+    'org': '$repo_owner',
+    'title': title_val,
+    'author': author_val,
+    'created_at': datetime.now(timezone.utc).isoformat(),
+    'review_started_at': datetime.now(timezone.utc).isoformat(),
+    'status': 'reviewing',
+    'session_id': None,
+    'pid': $$,
+    'trigger': 'slack',
+    'priority': 'normal',
+    'source_channel': '$channel_id',
+    'source_message': message_val
+}
+with open('$session_dir/meta.json', 'w') as f:
+    json.dump(meta, f, indent=2)
+" <<METAEOF
+$(python3 -c "import json,sys; print(json.dumps(sys.stdin.read().strip()))" <<< "$short_title")
+$(python3 -c "import json,sys; print(json.dumps(sys.stdin.read().strip()))" <<< "$author")
+$(python3 -c "import json,sys; print(json.dumps(sys.stdin.read().strip()))" <<< "$msg_text")
+METAEOF
+
+_log "Starting implementation for: $short_title"
+
+# --- Set up the working directory ---
+# Try to find a local repo path from config
+local_repo=$(_config_repo_path "$repo_name")
+reviews_dir="$(_reviews_dir)"
+work_dir=""
+
+if [[ -n "$local_repo" ]] && [[ -d "${local_repo/#\~/$HOME}/.git" ]]; then
+    local_repo="${local_repo/#\~/$HOME}"
+
+    # Create a branch name from the message
+    branch_name=$(echo "$msg_text" | head -1 | \
+        tr '[:upper:]' '[:lower:]' | \
+        sed 's/[^a-z0-9 ]//g' | \
+        tr ' ' '-' | \
+        cut -c1-40 | \
+        sed 's/-$//')
+    branch_name="slack/${branch_name}"
+
+    # Create a worktree for the implementation
+    work_dir="$reviews_dir/$repo_name/slack-${msg_key##*-}"
+    mkdir -p "$reviews_dir/$repo_name"
+
+    _log "Creating worktree at $work_dir from $local_repo"
+
+    # Fetch latest main/master
+    git -C "$local_repo" fetch origin 2>>"$session_dir/clone-stderr.log" || true
+
+    # Determine default branch
+    default_branch=$(git -C "$local_repo" symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's|refs/remotes/origin/||' || echo "main")
+
+    if [[ -d "$work_dir" ]]; then
+        _log "Worktree already exists, reusing"
+    else
+        git -C "$local_repo" worktree add -b "$branch_name" "$work_dir" "origin/$default_branch" 2>>"$session_dir/clone-stderr.log" || {
+            _log "Worktree creation failed, trying without branch"
+            git -C "$local_repo" worktree add "$work_dir" "origin/$default_branch" 2>>"$session_dir/clone-stderr.log" || {
+                _log "Worktree creation failed, falling back to clone"
+                work_dir=""
+            }
+        }
+    fi
+elif [[ -n "$target_repo" ]]; then
+    # No local repo — do a fresh clone
+    work_dir="$reviews_dir/$repo_name/slack-${msg_key##*-}"
+    mkdir -p "$reviews_dir/$repo_name"
+
+    if [[ ! -d "$work_dir/.git" ]]; then
+        _log "Cloning $target_repo into $work_dir"
+        git clone --depth 50 "https://github.com/${target_repo}.git" "$work_dir" 2>>"$session_dir/clone-stderr.log" || {
+            _log "Clone failed"
+            work_dir=""
+        }
+    fi
+
+    if [[ -n "$work_dir" ]] && [[ -d "$work_dir/.git" ]]; then
+        branch_name=$(echo "$msg_text" | head -1 | \
+            tr '[:upper:]' '[:lower:]' | \
+            sed 's/[^a-z0-9 ]//g' | \
+            tr ' ' '-' | \
+            cut -c1-40 | \
+            sed 's/-$//')
+        branch_name="slack/${branch_name}"
+        git -C "$work_dir" checkout -b "$branch_name" 2>>"$session_dir/clone-stderr.log" || true
+    fi
+fi
+
+if [[ -z "$work_dir" ]]; then
+    _log "ERROR: Could not set up working directory"
+    _update_meta_status "$session_dir" "failed"
+    _notify "Slack Implementation Failed" "Could not set up repo for: $short_title"
+    exit 1
+fi
+
+# Update meta with the working directory
+python3 -c "
+import json
+with open('$session_dir/meta.json', 'r') as f:
+    meta = json.load(f)
+meta['review_clone'] = '$work_dir'
+with open('$session_dir/meta.json', 'w') as f:
+    json.dump(meta, f, indent=2)
+"
+
+# --- Build the implementation prompt ---
+implementation_prompt="You received this request from a Slack conversation:
+
+---
+${msg_text}
+---
+
+Author: ${author}
+Repository: ${target_repo}
+
+Analyze this message and implement what's being requested.
+Create a well-structured implementation with tests if appropriate.
+
+When you're done implementing:
+1. Stage and commit your changes with a clear commit message
+2. Push the branch to origin
+3. Create a PR using: gh pr create --title '<descriptive title>' --body '<description of what was implemented and why>'
+
+The PR description should reference that this was requested via Slack by ${author}.
+
+Start by understanding the codebase structure, then implement the requested changes."
+
+# Generate a session ID
+session_id=$(python3 -c "import uuid, time; print(uuid.uuid5(uuid.NAMESPACE_DNS, '$session_key-' + str(int(time.time()))))")
+
+# Write summary.md for Claude session monitor
+claude_project_path=$(echo "$work_dir" | sed "s|^/||" | sed "s|/|-|g")
+summary_dir="$HOME/.claude/projects/-${claude_project_path}/${session_id}/session-memory"
+mkdir -p "$summary_dir"
+cat > "$summary_dir/summary.md" << SUMMARY_EOF
+# Session Title
+
+Slack Implementation: ${short_title}
+SUMMARY_EOF
+
+_log "Running claude -p from $work_dir"
+
+if cd "$work_dir" && env -u CLAUDECODE claude -p "$implementation_prompt" \
+    --session-id "$session_id" \
+    --permission-mode "bypassPermissions" \
+    > "$session_dir/review.md" \
+    2>>"$session_dir/claude-stderr.log"; then
+
+    _log "Implementation complete"
+
+    # Try to extract the PR URL from Claude's output
+    pr_url=$(grep -oE 'https://github.com/[^ ]+/pull/[0-9]+' "$session_dir/review.md" | head -1 || true)
+    pr_number=0
+    if [[ -n "$pr_url" ]]; then
+        pr_number=$(echo "$pr_url" | grep -oE '[0-9]+$' || echo "0")
+    fi
+
+    python3 -c "
+import json
+from datetime import datetime, timezone
+with open('$session_dir/meta.json', 'r') as f:
+    meta = json.load(f)
+meta['status'] = 'ready'
+meta['session_id'] = '$session_id'
+meta['pid'] = None
+meta['review_completed_at'] = datetime.now(timezone.utc).isoformat()
+meta['review_clone'] = '$work_dir'
+pr_url = '$pr_url'
+if pr_url:
+    meta['pr_url'] = pr_url
+    meta['pr_number'] = int('$pr_number') if '$pr_number'.isdigit() else 0
+with open('$session_dir/meta.json', 'w') as f:
+    json.dump(meta, f, indent=2)
+"
+
+    _notify "Slack Implementation Ready" "$short_title"
+
+else
+    _log "Implementation FAILED (exit code: $?)"
+
+    _update_meta_status "$session_dir" "failed"
+    _notify "Slack Implementation Failed" "$short_title"
+fi

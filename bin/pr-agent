@@ -1,0 +1,998 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+PR_AGENT_HOME="${PR_AGENT_HOME:-$HOME/.pr-agent}"
+PR_AGENT_DIR="$(cd "$(dirname "$(readlink -f "$0" 2>/dev/null || realpath "$0" 2>/dev/null || echo "$0")")/.." && pwd)"
+CONFIG_FILE="$PR_AGENT_HOME/config.yaml"
+STATE_FILE="$PR_AGENT_HOME/state.json"
+SESSIONS_DIR="$PR_AGENT_HOME/sessions"
+LAUNCHD_LABEL="com.averyjennings.pr-agent"
+LAUNCHD_PLIST="$HOME/Library/LaunchAgents/${LAUNCHD_LABEL}.plist"
+SLACK_LAUNCHD_LABEL="com.averyjennings.pr-agent-slack"
+SLACK_LAUNCHD_PLIST="$HOME/Library/LaunchAgents/${SLACK_LAUNCHD_LABEL}.plist"
+SLACK_STATE_FILE="$PR_AGENT_HOME/slack-state.json"
+
+source "$PR_AGENT_DIR/bin/lib-config.sh"
+
+# Ensure claude is findable — nvm/homebrew paths aren't always in PATH
+if ! command -v claude &>/dev/null; then
+    for p in "$HOME/.nvm/versions/node/"*/bin /opt/homebrew/bin /usr/local/bin; do
+        if [[ -x "$p/claude" ]]; then
+            export PATH="$p:$PATH"
+            break
+        fi
+    done
+fi
+
+# Ensure directories exist
+mkdir -p "$PR_AGENT_HOME" "$SESSIONS_DIR"
+
+# Install default config if missing
+if [[ ! -f "$CONFIG_FILE" ]]; then
+    cp "$PR_AGENT_DIR/config.yaml" "$CONFIG_FILE"
+fi
+
+# Initialize state if missing
+if [[ ! -f "$STATE_FILE" ]]; then
+    echo '{"seen_prs": {}, "last_poll": null}' > "$STATE_FILE"
+fi
+
+_log() {
+    echo "[pr-agent $(date '+%H:%M:%S')] $*"
+}
+
+# --- Commands ---
+
+cmd_list() {
+    local filter="${1:-all}"
+
+    if [[ ! -d "$SESSIONS_DIR" ]] || [[ -z "$(ls -A "$SESSIONS_DIR" 2>/dev/null)" ]]; then
+        echo "No PR reviews yet."
+        return
+    fi
+
+    printf "%-12s %-40s %s\n" "STATUS" "PR" "AGE"
+    printf "%-12s %-40s %s\n" "------" "--" "---"
+
+    for session_dir in "$SESSIONS_DIR"/*/; do
+        [[ -f "$session_dir/meta.json" ]] || continue
+
+        local status repo pr_num title created_at
+        status=$(_meta_field "$session_dir" "status")
+        repo=$(_meta_field "$session_dir" "repo")
+        pr_num=$(_meta_field "$session_dir" "pr_number")
+        title=$(_meta_field "$session_dir" "title")
+        title="${title:0:35}"
+        created_at=$(_meta_field "$session_dir" "created_at")
+
+        if [[ "$filter" != "all" ]] && [[ "$status" != "$filter" ]]; then
+            continue
+        fi
+
+        local icon
+        case "$status" in
+            reviewing)       icon="⚫" ;;
+            ready)           icon="🔵" ;;
+            in-progress)     icon="🟡" ;;
+            posted)          icon="✅" ;;
+            dismissed)       icon="⚪" ;;
+            failed)          icon="🔴" ;;
+            auto-monitoring) icon="👀" ;;
+            auto-responding) icon="💬" ;;
+            *)               icon="❓" ;;
+        esac
+
+        local age
+        age=$(_relative_time "$created_at")
+
+        printf "%-12s %-40s %s\n" "$icon $status" "${repo}#${pr_num} ${title}" "$age"
+    done
+}
+
+cmd_ide() {
+    local pr_ref="$1"
+    local session_dir
+
+    session_dir=$(_find_session "$pr_ref")
+    if [[ -z "$session_dir" ]]; then
+        echo "No session found for: $pr_ref"
+        return 1
+    fi
+
+    local review_clone
+    review_clone=$(_meta_field "$session_dir" "review_clone")
+
+    if [[ -z "$review_clone" ]] || [[ "$review_clone" == "None" ]] || [[ ! -d "$review_clone" ]]; then
+        echo "No review clone found for: $pr_ref"
+        echo "The review may not have created a worktree yet."
+        return 1
+    fi
+
+    local ide_cmd
+    ide_cmd=$(_ide_cmd)
+
+    _log "Opening $review_clone in $ide_cmd"
+    "$ide_cmd" "$review_clone"
+}
+
+cmd_open() {
+    local pr_ref="$1"
+    local session_dir
+
+    session_dir=$(_find_session "$pr_ref")
+    if [[ -z "$session_dir" ]]; then
+        echo "No session found for: $pr_ref"
+        return 1
+    fi
+
+    local session_id backend review_clone
+    session_id=$(_meta_field "$session_dir" "session_id")
+    backend=$(_meta_field "$session_dir" "backend")
+    backend="${backend:-claude}"
+    review_clone=$(_meta_field "$session_dir" "review_clone")
+
+    # Determine the working directory
+    local work_dir="/"
+    if [[ -n "$review_clone" ]] && [[ -d "$review_clone" ]]; then
+        work_dir="$review_clone"
+    fi
+
+    # If no session ID, the review is broken — re-run it in the background
+    if [[ -z "$session_id" ]] || [[ "$session_id" == "None" ]]; then
+        local pr_key repo pr_num pr_url title author created_at
+        pr_key=$(basename "$session_dir")
+        repo=$(_meta_field "$session_dir" "repo")
+        pr_num=$(_meta_field "$session_dir" "pr_number")
+        pr_url=$(_meta_field "$session_dir" "pr_url")
+        title=$(_meta_field "$session_dir" "title")
+        author=$(_meta_field "$session_dir" "author")
+        created_at=$(_meta_field "$session_dir" "created_at")
+
+        echo "Review for ${repo}#${pr_num} has no resumable session — re-running in background."
+        echo "It will appear as ready once complete."
+
+        # Clean up stale artifacts
+        rm -f "$session_dir/review.md" "$session_dir/comments.json" "$session_dir/claude-stderr.log"
+
+        # Re-spawn the full review pipeline in background
+        "$PR_AGENT_DIR/bin/pr-agent-review" \
+            "$pr_key" "$pr_url" "$title" "$repo" "$pr_num" "$author" "$created_at" &
+        return 0
+    fi
+
+    # Check if the headless review is still running
+    local review_pid
+    review_pid=$(_meta_field "$session_dir" "pid")
+    if [[ -n "$review_pid" ]] && [[ "$review_pid" != "None" ]] && kill -0 "$review_pid" 2>/dev/null; then
+        _log "Headless review still running (pid $review_pid) — resuming to peek at progress"
+    fi
+
+    case "$backend" in
+        claude)
+            # Resume the session. If the headless process is still running,
+            # this gives a live view — the background review keeps driving.
+            # When the user closes this terminal, the headless process continues.
+            _log "Resuming Claude session: $session_id (from $work_dir)"
+            cd "$work_dir" && env -u CLAUDECODE claude --resume "$session_id" --permission-mode bypassPermissions
+            ;;
+        codex|custom)
+            # Non-resumable backends can't be resumed — re-run the review
+            local pr_key repo pr_num
+            pr_key=$(basename "$session_dir")
+            repo=$(_meta_field "$session_dir" "repo")
+            pr_num=$(_meta_field "$session_dir" "pr_number")
+
+            echo "This review used the '$backend' backend which doesn't support resume."
+            echo "Re-running review for ${repo}#${pr_num} in background."
+
+            rm -f "$session_dir/review.md" "$session_dir/comments.json"
+            "$PR_AGENT_DIR/bin/pr-agent-review" \
+                "$pr_key" \
+                "$(_meta_field "$session_dir" "pr_url")" \
+                "$(_meta_field "$session_dir" "title")" \
+                "$repo" "$pr_num" \
+                "$(_meta_field "$session_dir" "author")" \
+                "$(_meta_field "$session_dir" "created_at")" &
+            ;;
+    esac
+}
+
+cmd_post() {
+    local pr_ref="$1"
+    local session_dir
+
+    session_dir=$(_find_session "$pr_ref")
+    if [[ -z "$session_dir" ]]; then
+        echo "No session found for: $pr_ref"
+        return 1
+    fi
+
+    local pr_url
+    pr_url=$(_meta_field "$session_dir" "pr_url")
+
+    if [[ -f "$session_dir/comments.json" ]]; then
+        _log "Posting comments to $pr_url"
+        python3 -c "
+import json, subprocess
+with open('$session_dir/comments.json') as f:
+    comments = json.load(f)
+for c in comments:
+    body = c.get('body', '')
+    path = c.get('path', '')
+    line = c.get('line', '')
+    if path and line:
+        body = f'**{path}:{line}**\n\n{body}'
+    subprocess.run(['gh', 'pr', 'comment', '$pr_url', '--body', body], check=True)
+"
+        _update_meta_status "$session_dir" "posted"
+    elif [[ -f "$session_dir/review.md" ]]; then
+        echo "No structured comments found. Posting review summary as a comment."
+        gh pr comment "$pr_url" --body-file "$session_dir/review.md"
+        _update_meta_status "$session_dir" "posted"
+    else
+        echo "No review output found yet."
+        return 1
+    fi
+}
+
+cmd_dismiss() {
+    local pr_ref="$1"
+    local session_dir
+
+    session_dir=$(_find_session "$pr_ref")
+    if [[ -z "$session_dir" ]]; then
+        echo "No session found for: $pr_ref"
+        return 1
+    fi
+
+    _update_meta_status "$session_dir" "dismissed"
+    _log "Dismissed: $pr_ref"
+}
+
+cmd_poll() {
+    _log "Starting poll..."
+    "$PR_AGENT_DIR/bin/pr-agent-poll"
+}
+
+cmd_start() {
+    if launchctl list "$LAUNCHD_LABEL" &>/dev/null; then
+        echo "Daemon already running. Use 'pr-agent restart' to restart."
+        return 0
+    fi
+
+    mkdir -p "$HOME/Library/LaunchAgents"
+    sed "s|__PR_AGENT_DIR__|$PR_AGENT_DIR|g; s|__PR_AGENT_HOME__|$PR_AGENT_HOME|g" \
+        "$PR_AGENT_DIR/launchd/com.averyjennings.pr-agent.plist.template" > "$LAUNCHD_PLIST"
+
+    launchctl load "$LAUNCHD_PLIST"
+    _log "Daemon started"
+}
+
+cmd_stop() {
+    if launchctl list "$LAUNCHD_LABEL" &>/dev/null; then
+        launchctl unload "$LAUNCHD_PLIST"
+        _log "Daemon stopped"
+    else
+        echo "Daemon not running."
+    fi
+}
+
+cmd_restart() {
+    cmd_stop 2>/dev/null || true
+    cmd_start
+}
+
+cmd_status() {
+    echo "=== PR Agent Status ==="
+    echo ""
+
+    if launchctl list "$LAUNCHD_LABEL" &>/dev/null; then
+        echo "GitHub Daemon: running"
+    else
+        echo "GitHub Daemon: stopped"
+    fi
+
+    if launchctl list "$SLACK_LAUNCHD_LABEL" &>/dev/null; then
+        echo "Slack Daemon: running"
+    else
+        echo "Slack Daemon: stopped"
+    fi
+
+    local total=0 reviewing=0 ready=0 in_progress=0 posted=0
+    for session_dir in "$SESSIONS_DIR"/*/; do
+        [[ -f "$session_dir/meta.json" ]] || continue
+        total=$((total + 1))
+        local s
+        s=$(_meta_field "$session_dir" "status")
+        case "$s" in
+            reviewing)   reviewing=$((reviewing + 1)) ;;
+            ready)       ready=$((ready + 1)) ;;
+            in-progress) in_progress=$((in_progress + 1)) ;;
+            posted)      posted=$((posted + 1)) ;;
+        esac
+    done
+
+    echo "Sessions: $total total ($reviewing reviewing, $ready ready, $in_progress in-progress, $posted posted)"
+    echo ""
+
+    local webhook_pid_file="$PR_AGENT_HOME/webhook.pid"
+    if [[ -f "$webhook_pid_file" ]] && kill -0 "$(cat "$webhook_pid_file")" 2>/dev/null; then
+        local webhook_port
+        webhook_port=$(_config_value "webhook_port")
+        webhook_port="${webhook_port:-9867}"
+        echo "Webhook: running (PID $(cat "$webhook_pid_file"), port $webhook_port)"
+    else
+        echo "Webhook: stopped"
+    fi
+    echo ""
+    echo "Config: $CONFIG_FILE"
+    echo "Sessions: $SESSIONS_DIR"
+}
+
+cmd_config() {
+    "${EDITOR:-vim}" "$CONFIG_FILE"
+}
+
+cmd_review() {
+    local ref="${1:-}"
+    if [[ -z "$ref" ]]; then
+        echo "Usage: pr-agent review <pr-ref>"
+        echo ""
+        echo "  pr-ref can be:"
+        echo "    1234                    PR number (searches across repos)"
+        echo "    mono#1234              repo#number"
+        echo "    coderabbitai/mono#1234  org/repo#number"
+        echo "    https://github.com/... Full PR URL"
+        return 1
+    fi
+
+    local org pr_key pr_url title repo pr_num author created_at
+    org=$(_config_value "github_org")
+
+    # Check if we already have a session for this ref
+    local session_dir
+    session_dir=$(_find_session "$ref") || true
+
+    if [[ -n "$session_dir" ]] && [[ -f "$session_dir/meta.json" ]]; then
+        pr_key=$(_meta_field "$session_dir" "pr_key")
+        pr_url=$(_meta_field "$session_dir" "pr_url")
+        title=$(_meta_field "$session_dir" "title")
+        repo=$(_meta_field "$session_dir" "repo")
+        pr_num=$(_meta_field "$session_dir" "pr_number")
+        author=$(_meta_field "$session_dir" "author")
+        created_at=$(_meta_field "$session_dir" "created_at")
+
+        _log "Re-reviewing $pr_key"
+        "$PR_AGENT_DIR/bin/pr-agent-review" "$pr_key" "$pr_url" "$title" "$repo" "$pr_num" "$author" "$created_at" &
+        return 0
+    fi
+
+    # No existing session — resolve the ref and fetch PR info from GitHub
+    if [[ "$ref" =~ ^https://github.com/ ]]; then
+        # Full URL: https://github.com/org/repo/pull/1234
+        pr_url="$ref"
+        repo=$(echo "$ref" | sed -E 's|https://github.com/[^/]+/([^/]+)/pull/.*|\1|')
+        pr_num=$(echo "$ref" | sed -E 's|.*/pull/([0-9]+).*|\1|')
+        org=$(echo "$ref" | sed -E 's|https://github.com/([^/]+)/.*|\1|')
+    elif [[ "$ref" =~ / ]]; then
+        # org/repo#number
+        org=$(echo "$ref" | sed -E 's|([^/]+)/.*|\1|')
+        repo=$(echo "$ref" | sed -E 's|[^/]+/([^#]+)#.*|\1|')
+        pr_num=$(echo "$ref" | sed -E 's|.*#([0-9]+)|\1|')
+    elif [[ "$ref" =~ \# ]]; then
+        # repo#number
+        repo=$(echo "$ref" | sed -E 's|([^#]+)#.*|\1|')
+        pr_num=$(echo "$ref" | sed -E 's|.*#([0-9]+)|\1|')
+    elif [[ "$ref" =~ ^[0-9]+$ ]]; then
+        # Bare PR number — search across org repos
+        pr_num="$ref"
+        _log "Searching for PR #$pr_num across $org repos..."
+        local found
+        found=$(gh api "search/issues?q=type:pr+org:${org}+${pr_num}+in:title&per_page=10" \
+            --jq ".items[] | select(.number == ${pr_num}) | \"\(.repository_url)|\(.pull_request.html_url)\"" 2>/dev/null | head -1)
+
+        if [[ -z "$found" ]]; then
+            # Search didn't match — try each repo with the PR number directly
+            found=$(gh api "search/issues?q=type:pr+org:${org}+is:pr&per_page=100" \
+                --jq ".items[] | select(.number == ${pr_num}) | \"\(.repository_url)|\(.pull_request.html_url)\"" 2>/dev/null | head -1)
+        fi
+
+        if [[ -z "$found" ]]; then
+            echo "Could not find PR #$pr_num in $org. Try repo#number or a full URL."
+            return 1
+        fi
+
+        repo=$(echo "$found" | cut -d'|' -f1 | sed 's|.*/||')
+        pr_url=$(echo "$found" | cut -d'|' -f2)
+    else
+        echo "Unrecognized PR ref: $ref"
+        echo "Try: 1234, repo#1234, org/repo#1234, or a GitHub URL"
+        return 1
+    fi
+
+    # Build PR URL if we don't have it yet
+    pr_url="${pr_url:-https://github.com/${org}/${repo}/pull/${pr_num}}"
+    pr_key="${org}-${repo}-${pr_num}"
+
+    # Fetch PR details from GitHub
+    _log "Fetching PR details for ${repo}#${pr_num}..."
+    local pr_json
+    pr_json=$(gh api "repos/${org}/${repo}/pulls/${pr_num}" 2>&1) || {
+        echo "Failed to fetch PR: $pr_json"
+        return 1
+    }
+
+    title=$(echo "$pr_json" | python3 -c "import json,sys; print(json.load(sys.stdin)['title'])")
+    author=$(echo "$pr_json" | python3 -c "import json,sys; print(json.load(sys.stdin)['user']['login'])")
+    created_at=$(echo "$pr_json" | python3 -c "import json,sys; print(json.load(sys.stdin)['created_at'])")
+
+    _mark_seen "$pr_key"
+    _log "Spawning review for ${repo}#${pr_num} — ${title} (by ${author})"
+    "$PR_AGENT_DIR/bin/pr-agent-review" "$pr_key" "$pr_url" "$title" "$repo" "$pr_num" "$author" "$created_at" &
+    echo "Review started for ${repo}#${pr_num}"
+}
+
+cmd_re_review() {
+    local ref="${1:-}"
+    local extra_prompt=""
+
+    # Parse --prompt flag
+    shift || true
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --prompt)
+                extra_prompt="$2"
+                shift 2
+                ;;
+            *)
+                shift
+                ;;
+        esac
+    done
+
+    if [[ -z "$ref" ]]; then
+        echo "Usage: pr-agent re-review <pr-ref> [--prompt 'instructions']"
+        return 1
+    fi
+
+    local session_dir
+    session_dir=$(_find_session "$ref")
+
+    if [[ -z "$session_dir" ]] || [[ ! -f "$session_dir/meta.json" ]]; then
+        echo "No session found for: $ref"
+        return 1
+    fi
+
+    local session_id review_clone pr_key repo pr_num pr_url title author org
+    session_id=$(_meta_field "$session_dir" "session_id")
+    review_clone=$(_meta_field "$session_dir" "review_clone")
+    pr_key=$(_meta_field "$session_dir" "pr_key")
+    repo=$(_meta_field "$session_dir" "repo")
+    pr_num=$(_meta_field "$session_dir" "pr_number")
+    pr_url=$(_meta_field "$session_dir" "pr_url")
+    title=$(_meta_field "$session_dir" "title")
+    author=$(_meta_field "$session_dir" "author")
+    org=$(_meta_field "$session_dir" "org")
+
+    if [[ -z "$session_id" ]]; then
+        echo "No session ID found — review may not have completed. Use 'pr-agent review' for a fresh review."
+        return 1
+    fi
+
+    # Build the full review prompt from current config (user may have changed it)
+    local full_prompt
+    full_prompt=$(_config_multiline "review_prompt")
+    full_prompt="${full_prompt//\{\{repo\}\}/$repo}"
+    full_prompt="${full_prompt//\{\{repo_full\}\}/$org/$repo}"
+    full_prompt="${full_prompt//\{\{pr_num\}\}/$pr_num}"
+    full_prompt="${full_prompt//\{\{title\}\}/$title}"
+    full_prompt="${full_prompt//\{\{author\}\}/$author}"
+    full_prompt="${full_prompt//\{\{pr_url\}\}/$pr_url}"
+
+    # Add extra instructions if provided
+    local extra_instructions=""
+    if [[ -n "$extra_prompt" ]]; then
+        extra_instructions="**Additional instructions for this re-review**: $extra_prompt"
+    fi
+    full_prompt="${full_prompt//\{\{extra_instructions\}\}/$extra_instructions}"
+
+    # Prepend re-review context
+    full_prompt="**RE-REVIEW**: You have already reviewed this PR once. Your previous analysis is in the conversation above. Now review it again using the full prompt below — your review standards or focus may have changed. Refine, add, or change your comments as needed.
+
+$full_prompt"
+
+    # Update status
+    _update_meta_status "$session_dir" "reviewing"
+
+    _log "Re-reviewing $pr_key (resuming session $session_id)"
+
+    # Run in background
+    (
+        local review_dir="${review_clone:-.}"
+        if cd "$review_dir" 2>/dev/null && env -u CLAUDECODE claude \
+            --resume "$session_id" \
+            -p "$full_prompt" \
+            --permission-mode "bypassPermissions" \
+            > "$session_dir/review.md" \
+            2>>"$session_dir/claude-stderr.log"; then
+
+            _update_meta_status "$session_dir" "ready"
+            _log "Re-review complete for $pr_key"
+            osascript -e "display notification \"Re-review complete\" with title \"PR Agent: $pr_key\"" 2>/dev/null || true
+        else
+            _update_meta_status "$session_dir" "failed"
+            _log "Re-review FAILED for $pr_key"
+        fi
+    ) &
+}
+
+cmd_discard() {
+    local target="${1:-}"
+    local reviews_dir
+    reviews_dir=$(_reviews_dir)
+
+    if [[ "$target" == "all" ]]; then
+        # Kill any running review and auto-monitor processes
+        pkill -f "pr-agent-review" 2>/dev/null || true
+        pkill -f "pr-agent-poll" 2>/dev/null || true
+        pkill -f "pr-agent-auto" 2>/dev/null || true
+        pkill -f "claude -p.*You are reviewing" 2>/dev/null || true
+
+        # Reset state + nuke sessions in one shot (no per-session worktree cleanup)
+        echo '{"seen_prs": {}, "last_poll": null}' > "$STATE_FILE"
+        local count
+        count=$(find "$SESSIONS_DIR" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l | tr -d ' ')
+        rm -rf "$SESSIONS_DIR"
+        mkdir -p "$SESSIONS_DIR"
+
+        # Bulk-remove all review worktrees and Claude session data
+        if [[ -d "$reviews_dir" ]]; then
+            # Prune worktree references from any local repos that point here
+            for repo_dir in "$reviews_dir"/*/; do
+                [[ -d "$repo_dir" ]] || continue
+                for wt in "$repo_dir"/pr-*/; do
+                    [[ -d "$wt/.git" ]] || continue
+                    local parent_git
+                    parent_git=$(cat "$wt/.git" 2>/dev/null | sed -n 's/^gitdir: //p')
+                    if [[ -n "$parent_git" ]]; then
+                        local repo_root
+                        repo_root=$(cd "$(dirname "$parent_git")/../.." 2>/dev/null && pwd)
+                        git -C "$repo_root" worktree prune 2>/dev/null || true
+                    fi
+                done
+            done
+            rm -rf "$reviews_dir"
+            mkdir -p "$reviews_dir"
+        fi
+        rm -rf "$HOME/.claude/projects/-$(echo "$reviews_dir" | sed 's|^/||' | sed 's|/|-|g')"*
+
+        _log "Discarded $count reviews and reset state"
+    elif [[ -n "$target" ]]; then
+        local session_dir
+        session_dir=$(_find_session "$target")
+        if [[ -z "$session_dir" ]]; then
+            echo "No session found for: $target"
+            return 1
+        fi
+
+        local pr_key
+        pr_key=$(basename "$session_dir")
+
+        # Remove worktree
+        _remove_review_worktree "$pr_key"
+
+        # Remove from seen state so it can be re-reviewed
+        python3 -c "
+import json
+with open('$STATE_FILE') as f:
+    s = json.load(f)
+s.get('seen_prs', {}).pop('$pr_key', None)
+with open('$STATE_FILE', 'w') as f:
+    json.dump(s, f, indent=2)
+"
+
+        # Remove session data
+        rm -rf "$session_dir"
+        _log "Discarded: $pr_key"
+    else
+        echo "Usage: pr-agent discard <pr-ref|all>"
+        echo ""
+        echo "Examples:"
+        echo "  pr-agent discard all        # Discard all reviews and reset state"
+        echo "  pr-agent discard mono-1234  # Discard a specific review"
+        echo "  pr-agent discard 1234       # Same, by PR number"
+        return 1
+    fi
+}
+
+cmd_webhook() {
+    local subcmd="${1:-help}"
+    shift || true
+
+    case "$subcmd" in
+        start)
+            local daemon=false
+            while [[ $# -gt 0 ]]; do
+                case "$1" in
+                    --daemon|-d) daemon=true; shift ;;
+                    *) shift ;;
+                esac
+            done
+
+            local pid_file="$PR_AGENT_HOME/webhook.pid"
+            if [[ -f "$pid_file" ]] && kill -0 "$(cat "$pid_file")" 2>/dev/null; then
+                echo "Webhook server already running (PID $(cat "$pid_file"))"
+                return 0
+            fi
+
+            if [[ "$daemon" == "true" ]]; then
+                _log "Starting webhook server in background"
+                nohup "$PR_AGENT_DIR/bin/pr-agent-webhook" >> "$PR_AGENT_HOME/webhook.log" 2>&1 &
+                local pid=$!
+                sleep 0.5
+                if kill -0 "$pid" 2>/dev/null; then
+                    _log "Webhook server started (PID $pid)"
+                else
+                    echo "Webhook server failed to start. Check $PR_AGENT_HOME/webhook.log"
+                    return 1
+                fi
+            else
+                _log "Starting webhook server in foreground (Ctrl-C to stop)"
+                exec "$PR_AGENT_DIR/bin/pr-agent-webhook"
+            fi
+            ;;
+
+        stop)
+            local pid_file="$PR_AGENT_HOME/webhook.pid"
+            if [[ -f "$pid_file" ]]; then
+                local pid
+                pid=$(cat "$pid_file")
+                if kill -0 "$pid" 2>/dev/null; then
+                    kill "$pid"
+                    _log "Webhook server stopped (PID $pid)"
+                else
+                    _log "Webhook server not running (stale PID file)"
+                    rm -f "$pid_file"
+                fi
+            else
+                echo "Webhook server not running (no PID file)"
+            fi
+            ;;
+
+        status)
+            local pid_file="$PR_AGENT_HOME/webhook.pid"
+            local port
+            port=$(_config_value "webhook_port")
+            port="${port:-9867}"
+
+            if [[ -f "$pid_file" ]] && kill -0 "$(cat "$pid_file")" 2>/dev/null; then
+                echo "Webhook: running (PID $(cat "$pid_file"), port $port)"
+            else
+                echo "Webhook: stopped"
+                [[ -f "$pid_file" ]] && rm -f "$pid_file"
+            fi
+            ;;
+
+        url)
+            local port
+            port=$(_config_value "webhook_port")
+            port="${port:-9867}"
+
+            echo "Webhook URL: http://localhost:${port}/webhook"
+            echo ""
+            echo "To receive webhooks from GitHub, you need to expose this port."
+            echo "Options:"
+            echo "  1. ngrok: ngrok http $port"
+            echo "  2. smee.io: npx smee -u https://smee.io/YOUR_CHANNEL -t http://localhost:${port}/webhook"
+            echo "  3. Direct: Configure your router/firewall to forward port $port"
+            echo ""
+            echo "GitHub webhook settings:"
+            echo "  1. Go to https://github.com/organizations/YOUR_ORG/settings/hooks"
+            echo "  2. Add webhook with the URL above"
+            echo "  3. Content type: application/json"
+            echo "  4. Secret: (match your config webhook_secret)"
+            echo "  5. Events: Pull requests"
+            ;;
+
+        help|*)
+            echo "Usage: pr-agent webhook <command>"
+            echo ""
+            echo "Commands:"
+            echo "  start [--daemon]  Start the webhook server (foreground by default)"
+            echo "  stop              Stop the webhook server"
+            echo "  status            Show if webhook is running"
+            echo "  url               Print webhook URL and setup instructions"
+            ;;
+    esac
+}
+
+cmd_slack() {
+    local subcmd="${1:-help}"
+    shift || true
+
+    case "$subcmd" in
+        poll)
+            _log "Running Slack poll..."
+            "$PR_AGENT_DIR/bin/pr-agent-slack"
+            ;;
+        start)
+            if launchctl list "$SLACK_LAUNCHD_LABEL" &>/dev/null; then
+                echo "Slack daemon already running. Use 'pr-agent slack restart' to restart."
+                return 0
+            fi
+
+            mkdir -p "$HOME/Library/LaunchAgents"
+            sed "s|__PR_AGENT_DIR__|$PR_AGENT_DIR|g; s|__PR_AGENT_HOME__|$PR_AGENT_HOME|g" \
+                "$PR_AGENT_DIR/launchd/com.averyjennings.pr-agent-slack.plist.template" > "$SLACK_LAUNCHD_PLIST"
+
+            launchctl load "$SLACK_LAUNCHD_PLIST"
+            _log "Slack daemon started"
+            ;;
+        stop)
+            if launchctl list "$SLACK_LAUNCHD_LABEL" &>/dev/null; then
+                launchctl unload "$SLACK_LAUNCHD_PLIST"
+                _log "Slack daemon stopped"
+            else
+                echo "Slack daemon not running."
+            fi
+            ;;
+        restart)
+            cmd_slack stop 2>/dev/null || true
+            cmd_slack start
+            ;;
+        status)
+            echo "=== Slack Integration Status ==="
+            echo ""
+
+            local channel token
+            channel=$(_config_value "slack_channel")
+            token=$(_config_value "slack_bot_token")
+
+            if [[ -n "$channel" ]] && [[ -n "$token" ]]; then
+                echo "Config: configured (channel: $channel)"
+            else
+                echo "Config: NOT configured"
+                [[ -z "$channel" ]] && echo "  - slack_channel: not set"
+                [[ -z "$token" ]] && echo "  - slack_bot_token: not set"
+            fi
+
+            if launchctl list "$SLACK_LAUNCHD_LABEL" &>/dev/null; then
+                echo "Daemon: running"
+            else
+                echo "Daemon: stopped"
+            fi
+
+            if [[ -f "$SLACK_STATE_FILE" ]]; then
+                local last_poll processed_count
+                last_poll=$(python3 -c "import json; print(json.load(open('$SLACK_STATE_FILE')).get('last_poll', 'never'))")
+                processed_count=$(python3 -c "import json; print(len(json.load(open('$SLACK_STATE_FILE')).get('processed_messages', {})))")
+                echo "Last poll: $last_poll"
+                echo "Processed messages: $processed_count"
+            else
+                echo "State: no polls yet"
+            fi
+
+            # Count Slack-triggered sessions
+            local slack_total=0 slack_reviewing=0 slack_ready=0
+            for session_dir in "$SESSIONS_DIR"/slack-*/; do
+                [[ -f "$session_dir/meta.json" ]] || continue
+                slack_total=$((slack_total + 1))
+                local s
+                s=$(_meta_field "$session_dir" "status")
+                case "$s" in
+                    reviewing) slack_reviewing=$((slack_reviewing + 1)) ;;
+                    ready)     slack_ready=$((slack_ready + 1)) ;;
+                esac
+            done
+            echo "Sessions: $slack_total total ($slack_reviewing implementing, $slack_ready ready)"
+            ;;
+        help|--help|-h)
+            echo "Usage: pr-agent slack <command>"
+            echo ""
+            echo "Commands:"
+            echo "  poll      Run one Slack poll cycle"
+            echo "  start     Start Slack polling daemon"
+            echo "  stop      Stop Slack polling daemon"
+            echo "  restart   Restart Slack polling daemon"
+            echo "  status    Show Slack integration status"
+            ;;
+        *)
+            echo "Unknown slack command: $subcmd (try 'pr-agent slack help')"
+            return 1
+            ;;
+    esac
+}
+
+cmd_auto() {
+    local subcmd="${1:-help}"
+    shift || true
+
+    case "$subcmd" in
+        list)
+            echo "=== Auto-Mode PRs ==="
+            echo ""
+            for session_dir in "$SESSIONS_DIR"/*/; do
+                [[ -f "$session_dir/meta.json" ]] || continue
+                local auto_mode status repo pr_num
+                auto_mode=$(_meta_field "$session_dir" "auto_mode")
+                [[ "$auto_mode" != "True" ]] && continue
+                status=$(_meta_field "$session_dir" "status")
+                repo=$(_meta_field "$session_dir" "repo")
+                pr_num=$(_meta_field "$session_dir" "pr_number")
+                local response_count
+                response_count=$(_meta_field "$session_dir" "auto_response_count" 2>/dev/null || echo "0")
+                printf "  %-30s %-20s responses: %s\n" "${repo}#${pr_num}" "$status" "$response_count"
+            done
+            ;;
+
+        users)
+            echo "Auto-review users:"
+            _config_list "auto_review_users" | while read -r user; do
+                echo "  - $user"
+            done
+            ;;
+
+        help|*)
+            echo "Usage: pr-agent auto <command>"
+            echo ""
+            echo "Commands:"
+            echo "  list    Show PRs in auto-mode"
+            echo "  users   Show configured auto-review users"
+            echo ""
+            echo "To add/remove users, edit config: pr-agent config"
+            echo "Add usernames under auto_review_users:"
+            echo "  auto_review_users:"
+            echo "    - username1"
+            echo "    - username2"
+            ;;
+    esac
+}
+
+cmd_clean() {
+    local days="${1:-$(_config_value 'retention_days')}"
+    days="${days:-30}"
+    local count=0
+    local reviews_dir
+    reviews_dir=$(_reviews_dir)
+
+    for session_dir in "$SESSIONS_DIR"/*/; do
+        [[ -f "$session_dir/meta.json" ]] || continue
+        local status created_at pr_key
+        status=$(_meta_field "$session_dir" "status")
+        created_at=$(_meta_field "$session_dir" "created_at")
+        pr_key=$(basename "$session_dir")
+
+        if [[ "$status" == "posted" || "$status" == "dismissed" ]]; then
+            local age_days
+            age_days=$(python3 -c "
+from datetime import datetime, timezone
+created = datetime.fromisoformat('$created_at')
+now = datetime.now(timezone.utc)
+print((now - created).days)
+")
+            if (( age_days > days )); then
+                _remove_review_worktree "$pr_key"
+                rm -rf "$session_dir"
+                count=$((count + 1))
+            fi
+        fi
+    done
+
+    _log "Cleaned $count sessions older than $days days"
+}
+
+# --- Internal helpers ---
+
+_remove_review_worktree() {
+    # Remove a review's git worktree properly (pr_key format: org-repo-num)
+    local pr_key="$1"
+    local reviews_dir
+    reviews_dir=$(_reviews_dir)
+
+    # Extract repo and pr_num from pr_key (org-repo-num)
+    local repo pr_num
+    repo=$(python3 -c "print('$pr_key'.rsplit('-', 1)[0].split('-', 1)[1])")
+    pr_num=$(python3 -c "print('$pr_key'.rsplit('-', 1)[1])")
+
+    local worktree_dir="$reviews_dir/$repo/pr-$pr_num"
+
+    if [[ -d "$worktree_dir" ]]; then
+        # Worktree belongs to the user's local repo — remove it from there
+        local local_repo
+        local_repo=$(_config_repo_path "$repo")
+        if [[ -n "$local_repo" ]] && [[ -d "$local_repo/.git" ]]; then
+            git -C "$local_repo" worktree remove "$worktree_dir" --force 2>/dev/null || rm -rf "$worktree_dir"
+            git -C "$local_repo" worktree prune 2>/dev/null || true
+        else
+            rm -rf "$worktree_dir"
+        fi
+    fi
+
+    # Clean up the pr-review branch
+    local cleanup_repo
+    cleanup_repo=$(_config_repo_path "$repo")
+    if [[ -n "$cleanup_repo" ]] && [[ -d "$cleanup_repo/.git" ]]; then
+        git -C "$cleanup_repo" branch -D "pr-review/$pr_num" 2>/dev/null || true
+    fi
+
+    # Also clean up old-style flat clones (pre-worktree migration)
+    if [[ -d "$reviews_dir/$pr_key" ]]; then
+        rm -rf "$reviews_dir/$pr_key"
+    fi
+}
+
+_find_session() {
+    local ref="$1"
+
+    for session_dir in "$SESSIONS_DIR"/*/; do
+        [[ -f "$session_dir/meta.json" ]] || continue
+        local dirname
+        dirname=$(basename "$session_dir")
+
+        if [[ "$dirname" == *"$ref"* ]] || \
+           grep -q "\"pr_number\": $ref" "$session_dir/meta.json" 2>/dev/null; then
+            echo "$session_dir"
+            return
+        fi
+    done
+}
+
+# --- Main ---
+
+cmd="${1:-help}"
+shift || true
+
+case "$cmd" in
+    list|ls)     cmd_list "${1:-all}" ;;
+    ide)         cmd_ide "$1" ;;
+    open|o)      cmd_open "$1" ;;
+    review|r)    cmd_review "$1" ;;
+    re-review)   cmd_re_review "$@" ;;
+    post|p)      cmd_post "$1" ;;
+    dismiss|d)   cmd_dismiss "$1" ;;
+    discard)     cmd_discard "${1:-}" ;;
+    poll)        cmd_poll ;;
+    start)       cmd_start ;;
+    stop)        cmd_stop ;;
+    restart)     cmd_restart ;;
+    status|st)   cmd_status ;;
+    config)      cmd_config ;;
+    slack)       cmd_slack "$@" ;;
+    auto)        cmd_auto "$@" ;;
+    clean)       cmd_clean "${1:-}" ;;
+    webhook|wh)  cmd_webhook "$@" ;;
+    help|--help|-h)
+        echo "Usage: pr-agent <command> [args]"
+        echo ""
+        echo "Commands:"
+        echo "  list [status]     List PR reviews (all|ready|reviewing|posted)"
+        echo "  ide <pr-ref>      Open review worktree in your IDE"
+        echo "  open <pr-ref>     Open agent session for a PR (resume review)"
+        echo "  post <pr-ref>     Post review comments to GitHub"
+        echo "  dismiss <pr-ref>  Dismiss a PR review"
+        echo "  discard <ref|all> Discard review(s) and remove clones"
+        echo "  poll              Run one poll cycle (usually run by daemon)"
+        echo "  start             Start background daemon"
+        echo "  stop              Stop background daemon"
+        echo "  restart           Restart background daemon"
+        echo "  status            Show daemon and session status"
+        echo "  auto <cmd>        Auto-mode management (list|users)"
+        echo "  slack <cmd>       Slack integration (poll|start|stop|status)"
+        echo "  config            Edit configuration"
+        echo "  clean [days]      Remove old completed sessions"
+        echo "  webhook <cmd>     Manage webhook server (start|stop|status|url)"
+        echo ""
+        echo "Examples:"
+        echo "  pr-agent list ready        # Show PRs ready for your review"
+        echo "  pr-agent ide mono-1234     # Open PR worktree in your IDE"
+        echo "  pr-agent open mono-1234    # Resume Claude session for PR #1234"
+        echo "  pr-agent open 1234         # Same, by PR number"
+        echo "  pr-agent post mono-1234    # Post agreed comments to GitHub"
+        echo "  pr-agent discard all       # Wipe all reviews and start fresh"
+        echo "  pr-agent discard 1234      # Discard a specific review"
+        ;;
+    *)
+        echo "Unknown command: $cmd (try 'pr-agent help')"
+        exit 1
+        ;;
+esac

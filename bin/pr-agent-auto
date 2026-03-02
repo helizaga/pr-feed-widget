@@ -1,0 +1,164 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+PR_AGENT_HOME="${PR_AGENT_HOME:-$HOME/.pr-agent}"
+PR_AGENT_DIR="$(cd "$(dirname "$(readlink -f "$0" 2>/dev/null || realpath "$0" 2>/dev/null || echo "$0")")/.." && pwd)"
+CONFIG_FILE="$PR_AGENT_HOME/config.yaml"
+SESSIONS_DIR="$PR_AGENT_HOME/sessions"
+LOG_FILE="$PR_AGENT_HOME/auto.log"
+
+source "$PR_AGENT_DIR/bin/lib-config.sh"
+
+pr_key="$1"
+session_dir="$SESSIONS_DIR/$pr_key"
+
+_log() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [auto:${pr_key}] $*" | tee -a "$LOG_FILE"
+}
+
+# Read meta fields
+_read_meta() {
+    _meta_field "$session_dir" "$1" 2>/dev/null || echo ""
+}
+
+pr_url=$(_read_meta "pr_url")
+session_id=$(_read_meta "session_id")
+repo=$(_read_meta "repo")
+pr_num=$(_read_meta "pr_number")
+org=$(_read_meta "org")
+review_clone=$(_read_meta "review_clone")
+backend=$(_read_meta "backend")
+
+monitor_interval=$(_config_value "auto_monitor_interval")
+monitor_interval="${monitor_interval:-300}"
+max_responses=$(_config_value "auto_max_responses")
+max_responses="${max_responses:-10}"
+response_count=0
+
+_log "Starting auto-monitor (interval: ${monitor_interval}s, max responses: $max_responses)"
+
+# Clean up status on signal (pkill from UI, system shutdown, manual kill)
+trap '_update_meta_status "$session_dir" "ready"; _log "Caught signal, cleaning up"; exit 0' TERM INT
+
+# Track the last time we checked for comments
+last_check_time=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+while true; do
+    sleep "$monitor_interval"
+
+    # Check if PR is merged or closed (single API call)
+    pr_info=$(gh api "repos/${org}/${repo}/pulls/${pr_num}" --jq '{state,merged}' 2>/dev/null || echo '{"state":"open","merged":false}')
+    pr_state=$(echo "$pr_info" | python3 -c "import json,sys; print(json.load(sys.stdin).get('state','open'))")
+    pr_merged=$(echo "$pr_info" | python3 -c "import json,sys; print(str(json.load(sys.stdin).get('merged',False)).lower())")
+
+    if [[ "$pr_merged" == "true" ]]; then
+        _log "PR merged — stopping monitor"
+        _update_meta_status "$session_dir" "merged"
+        # Write merged_at (fetch from same endpoint, but we need the full field)
+        merged_at=$(gh api "repos/${org}/${repo}/pulls/${pr_num}" --jq '.merged_at // empty' 2>/dev/null || echo "")
+        if [[ -n "$merged_at" ]]; then
+            python3 -c "
+import json
+with open('$session_dir/meta.json', 'r') as f:
+    meta = json.load(f)
+meta['merged_at'] = '$merged_at'
+with open('$session_dir/meta.json', 'w') as f:
+    json.dump(meta, f, indent=2)
+"
+        fi
+        exit 0
+    fi
+
+    if [[ "$pr_state" == "closed" ]]; then
+        _log "PR closed (not merged) — stopping monitor"
+        _update_meta_status "$session_dir" "dismissed"
+        exit 0
+    fi
+
+    # Check response count limit
+    if (( response_count >= max_responses )); then
+        _log "Max responses ($max_responses) reached — stopping monitor"
+        _update_meta_status "$session_dir" "ready"
+        exit 0
+    fi
+
+    # Fetch new comments since last check
+    new_comments=$(gh api "repos/${org}/${repo}/issues/${pr_num}/comments?since=${last_check_time}" \
+        --jq '[.[] | select(.user.login != "coderabbitai[bot]" and (.user.type // "User") != "Bot") | {user: .user.login, body: .body, created_at: .created_at}]' 2>/dev/null || echo "[]")
+
+    last_check_time=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+    # Update auto_last_checked in meta
+    python3 -c "
+import json
+from datetime import datetime, timezone
+with open('$session_dir/meta.json', 'r') as f:
+    meta = json.load(f)
+meta['auto_last_checked'] = datetime.now(timezone.utc).isoformat()
+with open('$session_dir/meta.json', 'w') as f:
+    json.dump(meta, f, indent=2)
+"
+
+    comment_count=$(echo "$new_comments" | python3 -c "import json,sys; print(len(json.load(sys.stdin)))" 2>/dev/null || echo "0")
+
+    if (( comment_count == 0 )); then
+        continue
+    fi
+
+    _log "Found $comment_count new comments — responding"
+    response_count=$((response_count + 1))
+
+    # Update status
+    _update_meta_status "$session_dir" "auto-responding"
+
+    # Build response prompt
+    response_prompt="New comments have been posted on this PR since your last review. Here are the new comments:
+
+$(echo "$new_comments" | python3 -c "
+import json, sys
+comments = json.load(sys.stdin)
+for c in comments:
+    print(f\"**{c['user']}** said:\n{c['body']}\n\")
+")
+
+Please review these new comments and respond appropriately. If they raise valid concerns, update your review. If they ask questions, answer them. Output any new comments you'd like to post in the same structured format as before."
+
+    # Only Claude backend supports session resume
+    if [[ "$backend" == "claude" ]] && [[ -n "$session_id" ]]; then
+        local_dir="${review_clone:-.}"
+        if cd "$local_dir" 2>/dev/null; then
+            env -u CLAUDECODE claude \
+                --resume "$session_id" \
+                -p "$response_prompt" \
+                --permission-mode "bypassPermissions" \
+                > "$session_dir/response-${response_count}.md" \
+                2>>"$session_dir/claude-stderr.log" || {
+                _log "Response failed"
+                _update_meta_status "$session_dir" "auto-monitoring"
+                continue
+            }
+        fi
+
+        # Auto-post the response
+        if [[ -f "$session_dir/response-${response_count}.md" ]]; then
+            gh pr comment "$pr_url" --body-file "$session_dir/response-${response_count}.md" 2>/dev/null || {
+                _log "Failed to post response comment"
+            }
+        fi
+    else
+        _log "Backend '$backend' doesn't support session resume — skipping response"
+    fi
+
+    # Update meta
+    python3 -c "
+import json
+with open('$session_dir/meta.json', 'r') as f:
+    meta = json.load(f)
+meta['auto_response_count'] = $response_count
+meta['status'] = 'auto-monitoring'
+with open('$session_dir/meta.json', 'w') as f:
+    json.dump(meta, f, indent=2)
+"
+
+    _log "Response $response_count posted, back to monitoring"
+done

@@ -1,0 +1,336 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+PR_AGENT_HOME="${PR_AGENT_HOME:-$HOME/.pr-agent}"
+PR_AGENT_DIR="$(cd "$(dirname "$(readlink -f "$0" 2>/dev/null || realpath "$0" 2>/dev/null || echo "$0")")/.." && pwd)"
+CONFIG_FILE="$PR_AGENT_HOME/config.yaml"
+SESSIONS_DIR="$PR_AGENT_HOME/sessions"
+LOG_FILE="$PR_AGENT_HOME/poll.log"
+
+source "$PR_AGENT_DIR/bin/lib-config.sh"
+
+# Ensure claude is findable — nvm/homebrew paths aren't in launchd's PATH
+if ! command -v claude &>/dev/null; then
+    for p in "$HOME/.nvm/versions/node/"*/bin /opt/homebrew/bin /usr/local/bin; do
+        if [[ -x "$p/claude" ]]; then
+            export PATH="$p:$PATH"
+            break
+        fi
+    done
+fi
+
+CLAUDE_BIN=$(command -v claude 2>/dev/null || true)
+if [[ -z "$CLAUDE_BIN" ]]; then
+    echo "Error: claude CLI not found on PATH" >&2
+    exit 1
+fi
+
+pr_key="$1"
+pr_url="$2"
+title="$3"
+repo="$4"
+pr_num="$5"
+author="$6"
+created_at="$7"
+
+session_dir="$SESSIONS_DIR/$pr_key"
+reviews_dir="$(_reviews_dir)"
+org=$(echo "$pr_key" | cut -d- -f1)
+mkdir -p "$session_dir" "$reviews_dir"
+
+_log() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [review:${repo}#${pr_num}] $*" | tee -a "$LOG_FILE"
+}
+
+_notify() {
+    local ntitle="$1" message="$2"
+    osascript -e "display notification \"$message\" with title \"$ntitle\"" 2>/dev/null || true
+}
+
+# Determine review backend
+review_backend=$(_review_backend)
+
+# Check if auto-mode was pre-set by the poller
+auto_mode="false"
+if [[ -f "$session_dir/.auto_mode" ]]; then
+    auto_mode=$(cat "$session_dir/.auto_mode")
+    rm -f "$session_dir/.auto_mode"
+fi
+
+# Write initial meta
+python3 -c "
+import json
+from datetime import datetime, timezone
+meta = {
+    'pr_key': '$pr_key',
+    'pr_url': '$pr_url',
+    'pr_number': $pr_num,
+    'repo': '$repo',
+    'org': '$(echo "$pr_key" | cut -d- -f1)',
+    'title': $(python3 -c "import json; print(json.dumps('''$title'''))"),
+    'author': '$author',
+    'created_at': '$created_at',
+    'review_started_at': datetime.now(timezone.utc).isoformat(),
+    'status': 'reviewing',
+    'session_id': None,
+    'backend': '$review_backend',
+    'pid': $$,
+    'trigger': 'github-poll',
+    'priority': 'normal',
+    'auto_mode': $( [[ "$auto_mode" == "true" ]] && echo "True" || echo "False" )
+}
+with open('$session_dir/meta.json', 'w') as f:
+    json.dump(meta, f, indent=2)
+"
+
+_log "Starting review"
+
+# --- Set up git worktree from user's local repo for full code access ---
+local_repo=$(_config_repo_path "$repo")
+review_worktree="$reviews_dir/$repo/pr-$pr_num"
+
+if [[ -n "$local_repo" ]] && [[ -d "$local_repo/.git" ]]; then
+    # Fetch PR branch into the user's local repo
+    _log "Fetching PR #$pr_num into $local_repo"
+    git -C "$local_repo" fetch origin "pull/$pr_num/head:pr-review/$pr_num" --depth 50 2>>"$session_dir/clone-stderr.log" || {
+        _log "Could not fetch PR branch, will use default branch"
+    }
+
+    # Create worktree from the local repo — its .git file points back to
+    # the local repo, so session monitor groups it with the user's other worktrees
+    if [[ -d "$review_worktree" ]]; then
+        _log "Worktree pr-$pr_num already exists, updating"
+        git -C "$review_worktree" checkout "pr-review/$pr_num" 2>>"$session_dir/clone-stderr.log" || true
+    else
+        mkdir -p "$reviews_dir/$repo"
+        _log "Creating worktree for pr-$pr_num from $local_repo"
+        git -C "$local_repo" worktree add "$review_worktree" "pr-review/$pr_num" 2>>"$session_dir/clone-stderr.log" || {
+            # If the branch doesn't exist, create worktree from HEAD
+            git -C "$local_repo" worktree add "$review_worktree" HEAD 2>>"$session_dir/clone-stderr.log" || {
+                _log "Worktree creation failed, falling back to no-code review"
+                review_worktree="$reviews_dir/$repo"
+                mkdir -p "$review_worktree"
+            }
+        }
+    fi
+else
+    _log "No local repo configured for '$repo', reviewing without code access"
+    review_worktree="$reviews_dir/$repo"
+    mkdir -p "$review_worktree"
+fi
+
+# Build the review prompt — check for per-review override first
+extra_instructions=""
+if [[ -f "$session_dir/extra-prompt.txt" ]]; then
+    extra_instructions="**Additional instructions**: $(cat "$session_dir/extra-prompt.txt")"
+    rm -f "$session_dir/extra-prompt.txt"  # one-shot
+fi
+
+# Auto-comment mode: post comments directly for selected users
+if [[ "$(_config_list_contains "auto_comment_users" "$author")" == "yes" ]]; then
+    extra_instructions="${extra_instructions}
+
+**Auto-comment mode**: This PR is from a trusted contributor. Post your review comments directly on the PR as you go.
+
+For comments on specific lines of code, use inline review comments:
+  \`gh api repos/${org}/${repo}/pulls/${pr_num}/comments -f body='...' -f commit_id=\$(gh pr view ${pr_url} --json headRefOid -q .headRefOid) -f path='<file>' -f line=<line_number> -f side='RIGHT'\`
+
+For general feedback that doesn't map to a specific line, use a top-level comment:
+  \`gh pr comment ${pr_url} --body '...'\`
+
+Prefer inline comments where applicable — they're far more useful to the author. Comment freely on anything noteworthy — suggestions, potential issues, questions, or praise. However, do NOT approve the PR. Approval will be done manually by a human reviewer."
+    _log "Auto-comment enabled for author: $author"
+fi
+
+# Enrich with CodeRabbit context if available
+if [[ -f "$session_dir/coderabbit-comments.json" ]]; then
+    cr_comments=$(cat "$session_dir/coderabbit-comments.json")
+    extra_instructions="${extra_instructions}
+
+**CodeRabbit has already reviewed this PR.** Their comments are saved in the session directory. Key points from their review are included below — use them as input but form your own independent assessment.
+
+${cr_comments}"
+fi
+
+# Read the full prompt template and interpolate variables
+full_prompt=$(_config_multiline "review_prompt")
+full_prompt="${full_prompt//\{\{repo\}\}/$repo}"
+full_prompt="${full_prompt//\{\{repo_full\}\}/$org/$repo}"
+full_prompt="${full_prompt//\{\{pr_num\}\}/$pr_num}"
+full_prompt="${full_prompt//\{\{title\}\}/$title}"
+full_prompt="${full_prompt//\{\{author\}\}/$author}"
+full_prompt="${full_prompt//\{\{pr_url\}\}/$pr_url}"
+full_prompt="${full_prompt//\{\{extra_instructions\}\}/$extra_instructions}"
+
+_log "Running $review_backend review from $review_worktree"
+
+# Generate a unique session ID (uuid5 from pr_key + timestamp to avoid collisions on re-reviews)
+session_id=$(python3 -c "import uuid, time; print(uuid.uuid5(uuid.NAMESPACE_DNS, '$pr_key-' + str(int(time.time()))))")
+
+# Write summary.md so the Claude session monitor shows a readable name instead of a UUID
+_write_session_title() {
+    local project_path
+    project_path=$(echo "$review_worktree" | sed "s|^/||" | sed "s|/|-|g")
+    local summary_dir="$HOME/.claude/projects/-${project_path}/${session_id}/session-memory"
+    mkdir -p "$summary_dir"
+    cat > "$summary_dir/summary.md" << SUMMARY_EOF
+# Session Title
+
+Review: ${repo}#${pr_num} — ${title}
+SUMMARY_EOF
+}
+_write_session_title
+
+# Persist session_id and review_clone to meta.json now so they're available for resume during review
+_update_meta_field "$session_dir" "session_id" "$session_id"
+_update_meta_field "$session_dir" "review_clone" "$review_worktree"
+
+# --- Backend dispatch ---
+
+_run_claude_review() {
+    cd "$review_worktree" && env -u CLAUDECODE "$CLAUDE_BIN" -p "$full_prompt" \
+        --session-id "$session_id" \
+        --permission-mode "bypassPermissions" \
+        > "$session_dir/review.md" \
+        2>>"$session_dir/claude-stderr.log"
+}
+
+_run_codex_review() {
+    # Codex doesn't support session-id, so use a prefixed ID and mark as non-resumable
+    session_id="codex-$(python3 -c "import uuid; print(uuid.uuid4())")"
+
+    cd "$review_worktree" && codex --quiet \
+        --approval-mode full-auto \
+        -p "$full_prompt" \
+        > "$session_dir/review.md" \
+        2>"$session_dir/codex-stderr.log"
+}
+
+_run_custom_review() {
+    local cmd
+    cmd=$(_custom_review_cmd)
+    if [[ -z "$cmd" ]]; then
+        _log "ERROR: review_backend is 'custom' but custom_review_cmd is not set in config"
+        return 1
+    fi
+
+    # Write prompt to a temp file to avoid command injection via PR title/body
+    local prompt_file
+    prompt_file=$(mktemp)
+    printf '%s' "$full_prompt" > "$prompt_file"
+
+    # Substitute template variables — prompt_file is safe (temp path),
+    # prompt is intentionally not supported (injection vector)
+    cmd="${cmd//\{\{worktree\}\}/$review_worktree}"
+    cmd="${cmd//\{\{prompt_file\}\}/$prompt_file}"
+    cmd="${cmd//\{\{session_id\}\}/$session_id}"
+    cmd="${cmd//\{\{session_dir\}\}/$session_dir}"
+
+    cd "$review_worktree" && eval "$cmd"
+    local rc=$?
+    rm -f "$prompt_file"
+    return $rc
+}
+
+# Run the appropriate backend
+review_succeeded=false
+case "$review_backend" in
+    claude)
+        if _run_claude_review; then
+            review_succeeded=true
+        fi
+        ;;
+    codex)
+        if _run_codex_review; then
+            review_succeeded=true
+        fi
+        ;;
+    custom)
+        if _run_custom_review; then
+            review_succeeded=true
+        fi
+        ;;
+    *)
+        _log "Unknown review backend: $review_backend"
+        _update_meta_status "$session_dir" "failed"
+        _notify "PR Review Failed" "${repo}#${pr_num}: Unknown backend '$review_backend'"
+        exit 1
+        ;;
+esac
+
+if $review_succeeded; then
+    _log "Review complete (backend: $review_backend)"
+
+    # Determine if this backend supports session resume
+    resumable="true"
+    if [[ "$review_backend" != "claude" ]]; then
+        resumable="false"
+    fi
+
+    # Set status based on auto_mode
+    review_status="ready"
+    if [[ "$auto_mode" == "true" ]]; then
+        review_status="auto-monitoring"
+    fi
+
+    python3 -c "
+import json
+from datetime import datetime, timezone
+with open('$session_dir/meta.json', 'r') as f:
+    meta = json.load(f)
+meta['status'] = '$review_status'
+meta['session_id'] = '$session_id'
+meta['resumable'] = '$resumable' == 'true'
+meta['pid'] = None
+meta['review_completed_at'] = datetime.now(timezone.utc).isoformat()
+meta['review_clone'] = '$review_worktree'
+with open('$session_dir/meta.json', 'w') as f:
+    json.dump(meta, f, indent=2)
+"
+
+    # Auto-mode: post comments and start monitor
+    if [[ "$auto_mode" == "true" ]]; then
+        _log "Auto-mode: posting review comments to GitHub"
+
+        if [[ -f "$session_dir/comments.json" ]]; then
+            python3 -c "
+import json, subprocess
+with open('$session_dir/comments.json') as f:
+    comments = json.load(f)
+for c in comments:
+    body = c.get('body', '')
+    path = c.get('path', '')
+    line = c.get('line', '')
+    if path and line:
+        body = f'**{path}:{line}**\n\n{body}'
+    subprocess.run(['gh', 'pr', 'comment', '$pr_url', '--body', body], check=True)
+"
+        else
+            _log "Auto-mode: no comments.json found, skipping auto-post (review.md contains raw output not suitable for posting)"
+        fi
+
+        # Update meta with auto-posted info
+        python3 -c "
+import json
+from datetime import datetime, timezone
+with open('$session_dir/meta.json', 'r') as f:
+    meta = json.load(f)
+meta['auto_posted_at'] = datetime.now(timezone.utc).isoformat()
+meta['status'] = 'auto-monitoring'
+with open('$session_dir/meta.json', 'w') as f:
+    json.dump(meta, f, indent=2)
+"
+
+        # Spawn the auto-monitor daemon
+        _log "Auto-mode: starting monitor for ${repo}#${pr_num}"
+        "$PR_AGENT_DIR/bin/pr-agent-auto" "$pr_key" &
+    fi
+
+    _notify "PR Review Ready" "${repo}#${pr_num}: ${title}"
+
+else
+    _log "Review FAILED (backend: $review_backend, exit code: $?)"
+
+    _update_meta_status "$session_dir" "failed"
+    _notify "PR Review Failed" "${repo}#${pr_num}: ${title}"
+fi
