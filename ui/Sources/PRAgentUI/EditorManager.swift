@@ -165,8 +165,12 @@ class EditorManager: ObservableObject {
 
     private func openInTerminal(command: String, path: String) {
         // Use a .command file to avoid AppleScript and TCC permission dialogs
-        let launcherPath = NSTemporaryDirectory() + "pr-agent-editor.command"
-        let script = "#!/bin/bash\nexport TERM=\"${TERM:-xterm-256color}\"\ntput reset 2>/dev/null\nexec \(command) \"\(path)\"\n"
+        // Use a unique temp file to avoid race conditions with concurrent launches
+        let launcherPath = NSTemporaryDirectory() + "pr-agent-editor-\(ProcessInfo.processInfo.processIdentifier).command"
+        // Shell-escape command and path to prevent injection
+        let safeCommand = command.replacingOccurrences(of: "'", with: "'\\''")
+        let safePath = path.replacingOccurrences(of: "'", with: "'\\''")
+        let script = "#!/bin/bash\nexport TERM=\"${TERM:-xterm-256color}\"\ntput reset 2>/dev/null\nexec '\(safeCommand)' '\(safePath)'\n"
 
         try? script.write(toFile: launcherPath, atomically: true, encoding: .utf8)
 

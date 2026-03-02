@@ -441,6 +441,10 @@ cmd_re_review() {
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --prompt)
+                if [[ $# -lt 2 ]]; then
+                    echo "Error: --prompt requires a value"
+                    return 1
+                fi
                 extra_prompt="$2"
                 shift 2
                 ;;
@@ -866,7 +870,7 @@ cmd_clean() {
             local age_days
             age_days=$(python3 -c "
 from datetime import datetime, timezone
-created = datetime.fromisoformat('$created_at')
+created = datetime.fromisoformat('$created_at'.replace('Z', '+00:00'))
 now = datetime.now(timezone.utc)
 print((now - created).days)
 ")
@@ -889,10 +893,17 @@ _remove_review_worktree() {
     local reviews_dir
     reviews_dir=$(_reviews_dir)
 
-    # Extract repo and pr_num from pr_key (org-repo-num)
+    # Prefer canonical values from session metadata (handles dashed org/repo names)
     local repo pr_num
-    repo=$(python3 -c "print('$pr_key'.rsplit('-', 1)[0].split('-', 1)[1])")
-    pr_num=$(python3 -c "print('$pr_key'.rsplit('-', 1)[1])")
+    if [[ -f "$SESSIONS_DIR/$pr_key/meta.json" ]]; then
+        repo=$(_meta_field "$SESSIONS_DIR/$pr_key" "repo" 2>/dev/null || echo "")
+        pr_num=$(_meta_field "$SESSIONS_DIR/$pr_key" "pr_number" 2>/dev/null || echo "")
+    fi
+    # Fallback to string parsing if meta.json unavailable
+    if [[ -z "${repo:-}" ]] || [[ -z "${pr_num:-}" ]]; then
+        repo=$(python3 -c "print('$pr_key'.rsplit('-', 1)[0].split('-', 1)[1])")
+        pr_num=$(python3 -c "print('$pr_key'.rsplit('-', 1)[1])")
+    fi
 
     local worktree_dir="$reviews_dir/$repo/pr-$pr_num"
 
@@ -929,8 +940,9 @@ _find_session() {
         local dirname
         dirname=$(basename "$session_dir")
 
-        if [[ "$dirname" == *"$ref"* ]] || \
-           grep -q "\"pr_number\": $ref" "$session_dir/meta.json" 2>/dev/null; then
+        # Exact match on directory name or PR number (avoid substring collisions)
+        if [[ "$dirname" == "$ref" ]] || \
+           grep -qE "\"pr_number\":\s*${ref}\b" "$session_dir/meta.json" 2>/dev/null; then
             echo "$session_dir"
             return
         fi
@@ -944,12 +956,12 @@ shift || true
 
 case "$cmd" in
     list|ls)     cmd_list "${1:-all}" ;;
-    ide)         cmd_ide "$1" ;;
-    open|o)      cmd_open "$1" ;;
-    review|r)    cmd_review "$1" ;;
+    ide)         cmd_ide "${1:-}" ;;
+    open|o)      cmd_open "${1:-}" ;;
+    review|r)    cmd_review "${1:-}" ;;
     re-review)   cmd_re_review "$@" ;;
-    post|p)      cmd_post "$1" ;;
-    dismiss|d)   cmd_dismiss "$1" ;;
+    post|p)      cmd_post "${1:-}" ;;
+    dismiss|d)   cmd_dismiss "${1:-}" ;;
     discard)     cmd_discard "${1:-}" ;;
     poll)        cmd_poll ;;
     start)       cmd_start ;;

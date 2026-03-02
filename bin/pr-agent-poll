@@ -123,7 +123,7 @@ _fetch_repo_prs() {
     local pr_page=1
     while true; do
         page_results=$(gh api "repos/${org}/${repo}/pulls?state=open&per_page=100&page=${pr_page}" \
-            --jq '.[] | "\(.number)|https://api.github.com/repos/'"${org}"'/'"${repo}"'|\(.title)|\(.html_url)|\(.created_at)|\(.user.login)|\(.draft)"' 2>/dev/null) || {
+            --jq '.[] | "\(.number)|https://api.github.com/repos/'"${org}"'/'"${repo}"'|\(.title | gsub("[|]"; "-"))|\(.html_url)|\(.created_at)|\(.user.login)|\(.draft)"' 2>/dev/null) || {
             _log "WARNING: Failed to fetch PRs for ${repo} (page ${pr_page})"
             break
         }
@@ -281,7 +281,7 @@ for session_dir in "$SESSIONS_DIR"/*/; do
     if [[ -n "$last_merge_check" ]]; then
         seconds_since=$(python3 -c "
 from datetime import datetime, timezone
-last = datetime.fromisoformat('$last_merge_check')
+last = datetime.fromisoformat('$last_merge_check'.replace('Z', '+00:00'))
 now = datetime.now(timezone.utc)
 print(int((now - last).total_seconds()))
 " 2>/dev/null || echo "0")

@@ -229,7 +229,10 @@ def resume_session(pr_key, reason, details):
             log(f"Cannot resume {pr_key}: no session_id")
             return
 
-        work_dir = review_clone if review_clone and os.path.isdir(review_clone) else "/"
+        if not review_clone or not os.path.isdir(review_clone):
+            log(f"Cannot resume {pr_key}: review_clone '{review_clone}' is missing or inaccessible")
+            return
+        work_dir = review_clone
 
         prompt = f"""New activity on this PR since your last review:
 
@@ -268,16 +271,18 @@ Update your review assessment if needed."""
 
     # Wait in a separate thread (lock released, so other operations can proceed)
     def _wait():
-        proc.wait()
+        rc = proc.wait()
         with lock:
             try:
                 with open(meta_file) as f:
                     m = json.load(f)
-                m["status"] = "ready"
+                m["status"] = "ready" if rc == 0 else "failed"
                 m["pid"] = None
                 m["review_completed_at"] = datetime.now(timezone.utc).isoformat()
                 with open(meta_file, "w") as f:
                     json.dump(m, f, indent=2)
+                if rc != 0:
+                    log(f"Resume process for {pr_key} exited with code {rc}")
             except Exception as e:
                 log(f"Error updating meta after resume for {pr_key}: {e}")
     Thread(target=_wait, daemon=True).start()
@@ -303,11 +308,18 @@ class WebhookHandler(BaseHTTPRequestHandler):
             self.end_headers()
             return
 
+        MAX_PAYLOAD = 10 * 1024 * 1024  # 10 MB
         content_length = int(self.headers.get("Content-Length", 0))
         if content_length == 0:
             self.send_response(400)
             self.end_headers()
             self.wfile.write(b"Empty request body")
+            return
+        if content_length > MAX_PAYLOAD:
+            log(f"Rejected oversized payload: {content_length} bytes")
+            self.send_response(413)
+            self.end_headers()
+            self.wfile.write(b"Payload too large")
             return
 
         payload = self.rfile.read(content_length)

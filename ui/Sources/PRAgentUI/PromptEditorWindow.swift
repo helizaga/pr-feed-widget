@@ -180,7 +180,12 @@ private struct PromptEditorContent: View {
             content += "\nreview_prompt: |\n\(indentedPrompt)\n"
         }
 
-        try? content.write(toFile: configPath, atomically: true, encoding: .utf8)
+        do {
+            try content.write(toFile: configPath, atomically: true, encoding: .utf8)
+        } catch {
+            // Write failed — don't show the "saved" indicator
+            return
+        }
 
         withAnimation {
             savedIndicator = true

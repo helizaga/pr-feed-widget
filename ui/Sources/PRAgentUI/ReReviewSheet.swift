@@ -40,6 +40,7 @@ private struct ReReviewContent: View {
     @ObservedObject var store: PRReviewStore
     let onClose: () -> Void
     @State private var extraPrompt: String = ""
+    @State private var showingFreshConfirm = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -80,12 +81,17 @@ private struct ReReviewContent: View {
 
             HStack {
                 Button("Start Fresh") {
-                    store.freshReview(review: review, extraPrompt: extraPrompt)
-                    onClose()
+                    showingFreshConfirm = true
                 }
                 .buttonStyle(.plain)
                 .foregroundStyle(.secondary)
                 .font(.caption)
+                .confirmationDialog("This will discard the current review and start over.", isPresented: $showingFreshConfirm) {
+                    Button("Start Fresh", role: .destructive) {
+                        store.freshReview(review: review, extraPrompt: extraPrompt)
+                        onClose()
+                    }
+                }
 
                 Spacer()
 

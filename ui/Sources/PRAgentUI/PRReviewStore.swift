@@ -510,7 +510,8 @@ class PRReviewStore: ObservableObject {
             // Find and kill pr-agent-auto processes for this pr_key
             let task = Process()
             task.executableURL = URL(fileURLWithPath: "/usr/bin/pkill")
-            task.arguments = ["-f", "pr-agent-auto \(review.prKey)"]
+            // Anchor the pattern to avoid matching unrelated processes
+            task.arguments = ["-f", "pr-agent-auto \(NSRegularExpression.escapedPattern(for: review.prKey))$"]
             try? task.run()
             task.waitUntilExit()
 
@@ -564,12 +565,15 @@ class PRReviewStore: ObservableObject {
             .appendingPathComponent(review.prKey)
             .appendingPathComponent("meta.json")
 
+        // Write atomically to a temp file then rename to prevent partial writes
         guard let data = try? Data(contentsOf: metaFile),
               var json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return }
 
         json["status"] = status.rawValue
         guard let updated = try? JSONSerialization.data(withJSONObject: json, options: .prettyPrinted) else { return }
-        try? updated.write(to: metaFile)
+        let tmpFile = metaFile.appendingPathExtension("tmp")
+        try? updated.write(to: tmpFile)
+        try? FileManager.default.replaceItemAt(metaFile, withItemAt: tmpFile)
 
         loadReviews()
     }

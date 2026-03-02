@@ -59,7 +59,11 @@ private func runGH(_ arguments: [String]) -> String {
     let pipe = Pipe()
     task.standardOutput = pipe
     task.standardError = FileHandle.nullDevice
-    try? task.run()
+    do {
+        try task.run()
+    } catch {
+        return ""
+    }
     // Read pipe BEFORE waitUntilExit — if gh output exceeds the 64KB kernel
     // pipe buffer (e.g. paginated org repos), both sides deadlock otherwise.
     let data = pipe.fileHandleForReading.readDataToEndOfFile()
@@ -373,7 +377,11 @@ private struct SettingsContent: View {
         // Update max_concurrent_reviews
         content = replaceYamlScalar(in: content, key: "max_concurrent_reviews", value: "\(maxConcurrentReviews)")
 
-        try? content.write(toFile: configPath, atomically: true, encoding: .utf8)
+        do {
+            try content.write(toFile: configPath, atomically: true, encoding: .utf8)
+        } catch {
+            return  // Don't show "Saved" if write failed
+        }
 
         withAnimation { savedIndicator = true }
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {

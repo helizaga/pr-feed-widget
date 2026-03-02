@@ -171,11 +171,15 @@ except:
         author="$resolved_name"
     fi
 
-    _mark_processed "$msg_key"
-
-    # Spawn the implementation review
+    # Spawn the implementation review, then mark processed only on success
     _log "Spawning implementation agent for message $msg_key"
     "$PR_AGENT_DIR/bin/pr-agent-slack-review" "$msg_key" "$slack_channel" "$msg_text" "$author" "$target_repo" &
+    local spawn_pid=$!
+    if kill -0 "$spawn_pid" 2>/dev/null; then
+        _mark_processed "$msg_key"
+    else
+        _log "WARNING: Failed to spawn review for $msg_key"
+    fi
 
     new_count=$((new_count + 1))
 done < "$triggered_file"
