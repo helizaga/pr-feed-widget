@@ -248,12 +248,16 @@ Update your review assessment if needed."""
         # Spawn process and write status+PID atomically under lock
         meta["status"] = "reviewing"
         meta["review_started_at"] = datetime.now(timezone.utc).isoformat()
+        out_file = None
+        err_file = None
         try:
+            out_file = open(os.path.join(session_dir, "re-review.md"), "w")
+            err_file = open(os.path.join(session_dir, "claude-stderr.log"), "a")
             proc = subprocess.Popen(
                 ["claude", "--resume", session_id, "-p", prompt, "--permission-mode", "bypassPermissions"],
                 cwd=work_dir,
-                stdout=open(os.path.join(session_dir, "re-review.md"), "w"),
-                stderr=open(os.path.join(session_dir, "claude-stderr.log"), "a"),
+                stdout=out_file,
+                stderr=err_file,
                 start_new_session=True,
                 env={k: v for k, v in os.environ.items() if k != "CLAUDECODE"},
             )
@@ -267,6 +271,10 @@ Update your review assessment if needed."""
             meta["status"] = "ready"  # revert
             with open(meta_file, "w") as f:
                 json.dump(meta, f, indent=2)
+            if out_file:
+                out_file.close()
+            if err_file:
+                err_file.close()
             return
 
     # Wait in a separate thread (lock released, so other operations can proceed)

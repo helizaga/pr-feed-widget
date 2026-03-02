@@ -124,7 +124,7 @@ for msg in messages:
 
     if has_trigger and text.strip():
         # Escape for bash: replace newlines with \\\\n, pipes with placeholder
-        safe_text = text.replace('\\\\', '\\\\\\\\').replace('|', '__PIPE__').replace('\\n', '\\\\n')
+        safe_text = text.replace('\\\\', '\\\\\\\\').replace('|', '__PIPE__').replace(chr(10), '\\\\n')
         print(f'{ts}|{user}|{safe_text}')
 " > "$triggered_file"
 
@@ -175,10 +175,12 @@ except:
     _log "Spawning implementation agent for message $msg_key"
     "$PR_AGENT_DIR/bin/pr-agent-slack-review" "$msg_key" "$slack_channel" "$msg_text" "$author" "$target_repo" &
     local spawn_pid=$!
+    # Brief delay to let the process start (or fail immediately)
+    sleep 0.1
     if kill -0 "$spawn_pid" 2>/dev/null; then
         _mark_processed "$msg_key"
     else
-        _log "WARNING: Failed to spawn review for $msg_key"
+        _log "WARNING: Failed to spawn review for $msg_key — will retry next poll"
     fi
 
     new_count=$((new_count + 1))

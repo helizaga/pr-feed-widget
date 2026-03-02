@@ -61,17 +61,18 @@ if [[ -f "$session_dir/.auto_mode" ]]; then
     rm -f "$session_dir/.auto_mode"
 fi
 
-# Write initial meta
+# Write initial meta — pipe user-derived title via stdin to avoid injection
 python3 -c "
-import json
+import json, sys
 from datetime import datetime, timezone
+title_val = json.loads(sys.stdin.readline())
 meta = {
     'pr_key': '$pr_key',
     'pr_url': '$pr_url',
     'pr_number': $pr_num,
     'repo': '$repo',
     'org': '$(echo "$pr_key" | cut -d- -f1)',
-    'title': $(python3 -c "import json; print(json.dumps('''$title'''))"),
+    'title': title_val,
     'author': '$author',
     'created_at': '$created_at',
     'review_started_at': datetime.now(timezone.utc).isoformat(),
@@ -85,7 +86,7 @@ meta = {
 }
 with open('$session_dir/meta.json', 'w') as f:
     json.dump(meta, f, indent=2)
-"
+" <<< "$(python3 -c "import json,sys; print(json.dumps(sys.stdin.read().strip()))" <<< "$title")"
 
 _log "Starting review"
 
@@ -333,7 +334,7 @@ with open('$session_dir/meta.json', 'w') as f:
     _notify "PR Review Ready" "${repo}#${pr_num}: ${title}"
 
 else
-    _log "Review FAILED (backend: $review_backend, exit code: $?)"
+    _log "Review FAILED (backend: $review_backend)"
 
     _update_meta_status "$session_dir" "failed"
     _notify "PR Review Failed" "${repo}#${pr_num}: ${title}"

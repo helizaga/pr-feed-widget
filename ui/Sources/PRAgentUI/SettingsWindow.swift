@@ -300,6 +300,9 @@ private struct SettingsContent: View {
     private func addManualUser() {
         let username = manualUsername.trimmingCharacters(in: .whitespaces)
         guard !username.isEmpty else { return }
+        // Reject characters that would corrupt YAML
+        let invalidChars = CharacterSet.newlines.union(CharacterSet(charactersIn: ":#"))
+        guard username.rangeOfCharacter(from: invalidChars) == nil else { return }
         autoCommentUsers.insert(username)
         manualUsername = ""
     }

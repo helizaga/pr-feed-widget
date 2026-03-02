@@ -147,10 +147,14 @@ Please review these new comments and respond appropriately. If they raise valid 
         fi
 
         # Auto-post the response
+        post_succeeded=false
         if [[ -f "$session_dir/response-${response_count}.md" ]]; then
-            gh pr comment "$pr_url" --body-file "$session_dir/response-${response_count}.md" 2>/dev/null || {
+            if gh pr comment "$pr_url" --body-file "$session_dir/response-${response_count}.md" 2>/dev/null; then
+                post_succeeded=true
+            else
                 _log "Failed to post response comment"
-            }
+                response_count=$((response_count - 1))  # don't count failed posts
+            fi
         fi
     else
         _log "Backend '$backend' doesn't support session resume — skipping response"
@@ -167,5 +171,7 @@ with open('$session_dir/meta.json', 'w') as f:
     json.dump(meta, f, indent=2)
 "
 
-    _log "Response $response_count posted, back to monitoring"
+    if $post_succeeded; then
+        _log "Response $response_count posted, back to monitoring"
+    fi
 done
