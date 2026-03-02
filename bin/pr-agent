@@ -523,8 +523,12 @@ $full_prompt"
 
     # Run in background
     (
-        local review_dir="${review_clone:-.}"
-        if cd "$review_dir" 2>/dev/null && env -u CLAUDECODE claude \
+        if [[ -z "$review_clone" ]] || [[ "$review_clone" == "None" ]] || [[ ! -d "$review_clone" ]]; then
+            _log "ERROR: review_clone is missing or inaccessible for $pr_key"
+            _update_meta_status "$session_dir" "failed"
+            exit 1
+        fi
+        if cd "$review_clone" 2>/dev/null && env -u CLAUDECODE claude \
             --resume "$session_id" \
             -p "$full_prompt" \
             --permission-mode "bypassPermissions" \
@@ -932,6 +936,7 @@ _remove_review_worktree() {
         # Worktree belongs to the user's local repo — remove it from there
         local local_repo
         local_repo=$(_config_repo_path "$repo")
+        local_repo="${local_repo/#\~/$HOME}"
         if [[ -n "$local_repo" ]] && [[ -d "$local_repo/.git" ]]; then
             git -C "$local_repo" worktree remove "$worktree_dir" --force 2>/dev/null || rm -rf "$worktree_dir"
             git -C "$local_repo" worktree prune 2>/dev/null || true
@@ -943,6 +948,7 @@ _remove_review_worktree() {
     # Clean up the pr-review branch
     local cleanup_repo
     cleanup_repo=$(_config_repo_path "$repo")
+    cleanup_repo="${cleanup_repo/#\~/$HOME}"
     if [[ -n "$cleanup_repo" ]] && [[ -d "$cleanup_repo/.git" ]]; then
         git -C "$cleanup_repo" branch -D "pr-review/$pr_num" 2>/dev/null || true
     fi

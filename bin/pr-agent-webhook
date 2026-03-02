@@ -306,7 +306,10 @@ Update your review assessment if needed."""
             try:
                 with open(meta_file) as f:
                     m = json.load(f)
-                m["status"] = "ready" if rc == 0 else "failed"
+                # Preserve terminal statuses (merged/dismissed) — don't clobber
+                current = m.get("status", "")
+                if current not in ("merged", "dismissed"):
+                    m["status"] = "ready" if rc == 0 else "failed"
                 m["pid"] = None
                 m["review_completed_at"] = datetime.now(timezone.utc).isoformat()
                 with open(meta_file, "w") as f:
@@ -346,7 +349,7 @@ class WebhookHandler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(b"Invalid Content-Length")
             return
-        if content_length == 0:
+        if content_length <= 0:
             self.send_response(400)
             self.end_headers()
             self.wfile.write(b"Empty request body")

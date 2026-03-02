@@ -100,12 +100,15 @@ if [[ -n "$local_repo" ]] && [[ -d "$local_repo/.git" ]]; then
     # the local repo, so session monitor groups it with the user's other worktrees
     if [[ -d "$review_worktree" ]]; then
         _log "Worktree pr-$pr_num already exists, updating"
-        git -C "$review_worktree" checkout "pr-review/$pr_num" 2>>"$session_dir/clone-stderr.log" || true
+        if ! git -C "$review_worktree" checkout "pr-review/$pr_num" 2>>"$session_dir/clone-stderr.log"; then
+            _log "WARNING: Could not checkout pr-review/$pr_num in existing worktree — review may use stale code"
+        fi
     else
         mkdir -p "$reviews_dir/$repo"
         _log "Creating worktree for pr-$pr_num from $local_repo"
         git -C "$local_repo" worktree add "$review_worktree" "pr-review/$pr_num" 2>>"$session_dir/clone-stderr.log" || {
             # If the branch doesn't exist, create worktree from HEAD
+            _log "WARNING: PR branch not available, falling back to HEAD — review may not reflect PR changes"
             git -C "$local_repo" worktree add "$review_worktree" HEAD 2>>"$session_dir/clone-stderr.log" || {
                 _log "Worktree creation failed, falling back to no-code review"
                 review_worktree="$reviews_dir/$repo"
@@ -320,6 +323,7 @@ for c in comments:
         failed += 1
 if failed:
     print(f'{failed} of {len(comments)} comment(s) failed to post', file=sys.stderr)
+    sys.exit(1)
 " || {
                 _log "Auto-post had failures, continuing to start monitor"
             }

@@ -175,6 +175,11 @@ class EditorManager: ObservableObject {
         let task = Process()
         task.executableURL = URL(fileURLWithPath: "/usr/bin/env")
         task.arguments = [command, path]
+        var env = ProcessInfo.processInfo.environment
+        let extraPaths = ["/opt/homebrew/bin", "/usr/local/bin"]
+        let currentPath = env["PATH"] ?? "/usr/bin:/bin:/usr/sbin:/sbin"
+        env["PATH"] = (extraPaths + [currentPath]).joined(separator: ":")
+        task.environment = env
         try? task.run()
     }
 
@@ -191,7 +196,7 @@ class EditorManager: ObservableObject {
 
         let chmod = Process()
         chmod.executableURL = URL(fileURLWithPath: "/bin/chmod")
-        chmod.arguments = ["+x", launcherPath]
+        chmod.arguments = ["700", launcherPath]
         try? chmod.run()
         chmod.waitUntilExit()
 

@@ -90,13 +90,16 @@ with open('$session_dir/meta.json', 'w') as f:
         exit 0
     fi
 
-    # Fetch new comments since last check
+    # Capture poll start time BEFORE fetching to avoid missing comments
+    # created between the fetch snapshot and timestamp assignment
+    poll_started=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
     # Fetch new human comments, excluding the bot's own identity to prevent recursion
     bot_login=$(gh api user --jq '.login' 2>/dev/null || echo "")
     new_comments=$(gh api "repos/${org}/${repo}/issues/${pr_num}/comments?since=${last_check_time}" \
         --jq '[.[] | select(.user.login != "coderabbitai[bot]" and (.user.type // "User") != "Bot" and .user.login != "'"${bot_login}"'") | {user: .user.login, body: .body, created_at: .created_at}]' 2>/dev/null || echo "[]")
 
-    last_check_time=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    last_check_time="$poll_started"
 
     # Update auto_last_checked in meta
     python3 -c "
