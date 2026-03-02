@@ -45,6 +45,7 @@ trap '_update_meta_status "$session_dir" "ready"; _log "Caught signal, cleaning 
 
 # Track the last time we checked for comments
 last_check_time=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+bot_login=$(gh api user --jq '.login' 2>/dev/null || echo "")
 
 while true; do
     sleep "$monitor_interval"
@@ -79,7 +80,6 @@ while true; do
     # Capture poll start time BEFORE fetching to avoid missing comments between fetch and timestamp update
     poll_started=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 
-    bot_login=$(gh api user --jq '.login' 2>/dev/null || echo "")
     new_comments=$(gh api "repos/${org}/${repo}/issues/${pr_num}/comments?since=${last_check_time}" \
         --jq '[.[] | select(.user.login != "coderabbitai[bot]" and (.user.type // "User") != "Bot" and .user.login != "'"${bot_login}"'") | {user: .user.login, body: .body, created_at: .created_at}]' 2>/dev/null || echo "[]")
 

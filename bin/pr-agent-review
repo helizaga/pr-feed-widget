@@ -36,17 +36,8 @@ _log() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] [review:${repo}#${pr_num}] $*" | tee -a "$LOG_FILE"
 }
 
-_notify() {
-    local ntitle="$1" message="$2"
-    osascript \
-        -e "on run argv" \
-        -e "display notification (item 2 of argv) with title (item 1 of argv)" \
-        -e "end run" \
-        -- "$ntitle" "$message" 2>/dev/null || true
-}
-
-# Determine review backend
-review_backend=$(_review_backend)
+review_backend=$(_config_value "review_backend")
+review_backend="${review_backend:-claude}"
 
 # Check if auto-mode was pre-set by the poller
 auto_mode="false"
@@ -206,7 +197,7 @@ _run_codex_review() {
 
 _run_custom_review() {
     local cmd
-    cmd=$(_custom_review_cmd)
+    cmd=$(_config_value "custom_review_cmd")
     if [[ -z "$cmd" ]]; then
         _log "ERROR: review_backend is 'custom' but custom_review_cmd is not set in config"
         return 1
@@ -281,11 +272,9 @@ from datetime import datetime, timezone
 with open('$session_dir/meta.json', 'r') as f:
     meta = json.load(f)
 meta['status'] = '$review_status'
-meta['session_id'] = '$session_id'
 meta['resumable'] = '$review_backend' == 'claude'
 meta['pid'] = None
 meta['review_completed_at'] = datetime.now(timezone.utc).isoformat()
-meta['review_clone'] = '$review_worktree'
 with open('$session_dir/meta.json', 'w') as f:
     json.dump(meta, f, indent=2)
 "

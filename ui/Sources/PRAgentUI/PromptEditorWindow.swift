@@ -155,6 +155,7 @@ private struct PromptEditorContent: View {
         guard let content = try? String(contentsOfFile: configPath, encoding: .utf8),
               let yaml = try? Yams.load(yaml: content) as? [String: Any],
               let p = yaml["review_prompt"] as? String else {
+            prompt = defaultPrompt
             return
         }
         prompt = p.trimmingCharacters(in: .whitespacesAndNewlines)

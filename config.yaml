@@ -1,17 +1,12 @@
-github_org: coderabbitai
-skip_repos:
-  - test-repo
-  - pr-reviewer_test
+github_org: your-org
+skip_repos: []
 
 # Local repo paths — used to create worktrees for review
 repos:
-  mono: ~/work/mono
-  website: ~/work/website
-  git-worktree-runner: ~/work/git-worktree-runner
-  docs: ~/work/docs
+  my-app: ~/work/my-app
 
 # IDE to open PRs in (code, cursor, zed, idea, sublime, vim)
-ide: cursor
+# ide: cursor
 
 # Where review clones live (shown in claude session monitor)
 reviews_dir: ~/pr-reviews
@@ -19,10 +14,6 @@ reviews_dir: ~/pr-reviews
 # Webhook server (alternative to polling for real-time PR notifications)
 webhook_port: 9867
 webhook_secret: ""
-
-# Polling intervals (seconds)
-poll_interval_github: 300
-poll_interval_slack: 120
 
 # Max concurrent review agents
 max_concurrent_reviews: 2
@@ -90,7 +81,6 @@ review_prompt: |
 # Slack integration — poll a channel for ideas and auto-implement as PRs
 slack_channel: ""              # Channel ID to poll (e.g., C0123456789)
 slack_bot_token: ""            # xoxb-... Bot User OAuth Token
-slack_poll_interval: 120       # seconds between polls
 slack_trigger_emoji: "rocket"  # React with this emoji to trigger implementation
 slack_target_repo: ""          # Default repo for implementations (e.g., owner/repo)
 

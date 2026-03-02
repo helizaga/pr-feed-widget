@@ -1,6 +1,14 @@
 import Foundation
 import AppKit
 
+private func augmentedEnvironment() -> [String: String] {
+    var env = ProcessInfo.processInfo.environment
+    let extraPaths = ["/opt/homebrew/bin", "/usr/local/bin"]
+    let currentPath = env["PATH"] ?? "/usr/bin:/bin:/usr/sbin:/sbin"
+    env["PATH"] = (extraPaths + [currentPath]).joined(separator: ":")
+    return env
+}
+
 struct KnownEditor: Identifiable {
     let id: String
     let displayName: String
@@ -30,12 +38,7 @@ struct KnownEditor: Identifiable {
         task.arguments = [name]
         task.standardOutput = FileHandle.nullDevice
         task.standardError = FileHandle.nullDevice
-        // macOS GUI apps have a minimal PATH; add common install locations
-        var env = ProcessInfo.processInfo.environment
-        let extraPaths = ["/opt/homebrew/bin", "/usr/local/bin"]
-        let currentPath = env["PATH"] ?? "/usr/bin:/bin:/usr/sbin:/sbin"
-        env["PATH"] = (extraPaths + [currentPath]).joined(separator: ":")
-        task.environment = env
+        task.environment = augmentedEnvironment()
         do {
             try task.run()
             task.waitUntilExit()
@@ -77,13 +80,13 @@ class EditorManager: ObservableObject {
         selectedEditorId = readEditorFromConfig()
     }
 
-    func refreshInstalledEditors() {
+    private func refreshInstalledEditors() {
         installedEditors = Self.registry.filter { $0.isInstalled }
     }
 
     // MARK: - Config read/write
 
-    func readEditorFromConfig() -> String? {
+    private func readEditorFromConfig() -> String? {
         guard let content = try? String(contentsOfFile: configPath, encoding: .utf8) else { return nil }
         for line in content.components(separatedBy: .newlines) {
             let trimmed = line.trimmingCharacters(in: .whitespaces)
@@ -171,11 +174,7 @@ class EditorManager: ObservableObject {
         let task = Process()
         task.executableURL = URL(fileURLWithPath: "/usr/bin/env")
         task.arguments = [command, path]
-        var env = ProcessInfo.processInfo.environment
-        let extraPaths = ["/opt/homebrew/bin", "/usr/local/bin"]
-        let currentPath = env["PATH"] ?? "/usr/bin:/bin:/usr/sbin:/sbin"
-        env["PATH"] = (extraPaths + [currentPath]).joined(separator: ":")
-        task.environment = env
+        task.environment = augmentedEnvironment()
         try? task.run()
     }
 

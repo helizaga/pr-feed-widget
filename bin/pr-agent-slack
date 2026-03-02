@@ -67,18 +67,6 @@ with open('$SLACK_STATE_FILE', 'w') as f:
 "
 }
 
-_update_last_poll() {
-    python3 -c "
-import json
-from datetime import datetime, timezone
-with open('$SLACK_STATE_FILE') as f:
-    s = json.load(f)
-s['last_poll'] = datetime.now(timezone.utc).isoformat()
-with open('$SLACK_STATE_FILE', 'w') as f:
-    json.dump(s, f, indent=2)
-"
-}
-
 # --- Main poll cycle ---
 
 _log "Slack poll cycle starting (channel: $slack_channel, emoji: $trigger_emoji)"
@@ -187,5 +175,13 @@ except:
 done < "$triggered_file"
 rm -f "$triggered_file"
 
-_update_last_poll
+python3 -c "
+import json
+from datetime import datetime, timezone
+with open('$SLACK_STATE_FILE') as f:
+    s = json.load(f)
+s['last_poll'] = datetime.now(timezone.utc).isoformat()
+with open('$SLACK_STATE_FILE', 'w') as f:
+    json.dump(s, f, indent=2)
+"
 _log "Slack poll cycle complete (found $new_count new messages)"

@@ -25,11 +25,16 @@ Automated PR review system with macOS menu bar UI.
 
 ### Statuses
 
+- `waiting-coderabbit` — Waiting for CodeRabbit review before starting
 - `reviewing` — Claude agent is running
 - `ready` — Review complete, awaiting human
 - `in-progress` — Human is engaging with agent
 - `posted` — Comments posted to PR
 - `dismissed` — Human chose not to review
+- `failed` — Review agent errored
+- `merged` — PR was merged
+- `auto-monitoring` — Auto-mode: watching for new comments
+- `auto-responding` — Auto-mode: responding to a comment
 
 ## Build
 

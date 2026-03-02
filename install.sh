@@ -6,14 +6,7 @@ BIN_DIR="$HOME/.local/bin"
 
 mkdir -p "$BIN_DIR"
 
-# Make scripts executable
-chmod +x "$SCRIPT_DIR/bin/pr-agent"
-chmod +x "$SCRIPT_DIR/bin/pr-agent-poll"
-chmod +x "$SCRIPT_DIR/bin/pr-agent-review"
-chmod +x "$SCRIPT_DIR/bin/pr-agent-webhook"
-chmod +x "$SCRIPT_DIR/bin/pr-agent-slack"
-chmod +x "$SCRIPT_DIR/bin/pr-agent-slack-review"
-chmod +x "$SCRIPT_DIR/bin/pr-agent-auto"
+chmod +x "$SCRIPT_DIR"/bin/pr-agent*
 
 # Symlink pr-agent to PATH
 ln -sf "$SCRIPT_DIR/bin/pr-agent" "$BIN_DIR/pr-agent"

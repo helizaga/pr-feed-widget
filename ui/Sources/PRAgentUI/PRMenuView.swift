@@ -370,13 +370,11 @@ struct PRRowView: View {
 
     var body: some View {
         HStack(spacing: 8) {
-            // Status icon
             Image(systemName: review.status.icon)
                 .foregroundStyle(review.status.color)
                 .font(.caption)
                 .frame(width: 16)
 
-            // PR info
             VStack(alignment: .leading, spacing: 2) {
                 HStack(spacing: 4) {
                     Text(review.displayName)

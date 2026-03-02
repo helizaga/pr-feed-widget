@@ -37,16 +37,6 @@ _config_list_contains() {
     _config_list "$key" | grep -qxF "$value" && echo "yes" || echo "no"
 }
 
-_is_seen() {
-    local pr_key="$1" file="${STATE_FILE:-$HOME/.pr-agent/state.json}"
-    python3 -c "
-import json
-with open('$file') as f:
-    s = json.load(f)
-print('yes' if '$pr_key' in s.get('seen_prs', {}) else 'no')
-"
-}
-
 _mark_seen() {
     local pr_key="$1" file="${STATE_FILE:-$HOME/.pr-agent/state.json}"
     python3 -c "
@@ -59,11 +49,6 @@ s['last_poll'] = datetime.now(timezone.utc).isoformat()
 with open('$file', 'w') as f:
     json.dump(s, f, indent=2)
 "
-}
-
-_is_skip_repo() {
-    local repo="$1"
-    _config_list "skip_repos" | grep -qxF "$repo" && echo "yes" || echo "no"
 }
 
 _update_meta_status() {
@@ -113,11 +98,8 @@ _meta_field() {
 }
 
 _config_repo_path() {
-    # Look up local path for a repo name from the repos: map in config
     local repo="$1" file="${CONFIG_FILE:-$HOME/.pr-agent/config.yaml}"
-    local path
-    path=$(sed -n "/^repos:/,/^[^ ]/p" "$file" | grep -E "^\s+${repo}:" | sed "s/^[[:space:]]*${repo}:[[:space:]]*//" | sed 's/^"//' | sed 's/"$//' | sed "s|^~|$HOME|")
-    echo "$path"
+    sed -n "/^repos:/,/^[^ ]/p" "$file" | grep -E "^\s+${repo}:" | sed "s/^[[:space:]]*${repo}:[[:space:]]*//" | sed 's/^"//' | sed 's/"$//' | sed "s|^~|$HOME|"
 }
 
 _ide_cmd() {
@@ -136,16 +118,6 @@ _ide_cmd() {
     esac
 }
 
-_review_backend() {
-    local backend
-    backend=$(_config_value "review_backend")
-    echo "${backend:-claude}"
-}
-
-_custom_review_cmd() {
-    _config_value "custom_review_cmd"
-}
-
 _reviews_dir() {
     local dir
     dir=$(_config_value "reviews_dir")
@@ -153,6 +125,15 @@ _reviews_dir() {
     # Expand ~
     dir="${dir/#\~/$HOME}"
     echo "$dir"
+}
+
+_notify() {
+    local ntitle="$1" message="$2"
+    osascript \
+        -e "on run argv" \
+        -e "display notification (item 2 of argv) with title (item 1 of argv)" \
+        -e "end run" \
+        -- "$ntitle" "$message" 2>/dev/null || true
 }
 
 _count_active_reviews() {

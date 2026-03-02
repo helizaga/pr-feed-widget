@@ -537,11 +537,7 @@ $full_prompt"
 
             _update_meta_status "$session_dir" "ready"
             _log "Re-review complete for $pr_key"
-            osascript \
-                -e "on run argv" \
-                -e "display notification (item 2 of argv) with title (item 1 of argv)" \
-                -e "end run" \
-                -- "PR Agent: $pr_key" "Re-review complete" 2>/dev/null || true
+            _notify "PR Agent: $pr_key" "Re-review complete"
         else
             _update_meta_status "$session_dir" "failed"
             _log "Re-review FAILED for $pr_key"
@@ -946,11 +942,8 @@ _remove_review_worktree() {
     fi
 
     # Clean up the pr-review branch
-    local cleanup_repo
-    cleanup_repo=$(_config_repo_path "$repo")
-    cleanup_repo="${cleanup_repo/#\~/$HOME}"
-    if [[ -n "$cleanup_repo" ]] && [[ -d "$cleanup_repo/.git" ]]; then
-        git -C "$cleanup_repo" branch -D "pr-review/$pr_num" 2>/dev/null || true
+    if [[ -n "$local_repo" ]] && [[ -d "$local_repo/.git" ]]; then
+        git -C "$local_repo" branch -D "pr-review/$pr_num" 2>/dev/null || true
     fi
 
     # Also clean up old-style flat clones (pre-worktree migration)

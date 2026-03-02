@@ -102,7 +102,6 @@ private struct SettingsContent: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            // --- Excluded Repos ---
             VStack(alignment: .leading, spacing: 6) {
                 Text("Excluded Repos")
                     .font(.headline)
@@ -157,7 +156,6 @@ private struct SettingsContent: View {
             Divider()
                 .padding(.bottom, 14)
 
-            // --- Concurrency ---
             VStack(alignment: .leading, spacing: 6) {
                 HStack {
                     Text("Max Concurrent Reviews")
@@ -178,7 +176,6 @@ private struct SettingsContent: View {
             Divider()
                 .padding(.bottom, 14)
 
-            // --- Auto-Comment Users ---
             VStack(alignment: .leading, spacing: 6) {
                 Text("Auto-Comment Users")
                     .font(.headline)
@@ -241,7 +238,6 @@ private struct SettingsContent: View {
 
             Spacer()
 
-            // Footer
             HStack {
                 Spacer()
                 if savedIndicator {

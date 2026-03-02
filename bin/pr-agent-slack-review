@@ -30,15 +30,6 @@ _log() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] [slack-review:${session_key}] $*" | tee -a "$LOG_FILE"
 }
 
-_notify() {
-    local ntitle="$1" message="$2"
-    osascript \
-        -e "on run argv" \
-        -e "display notification (item 2 of argv) with title (item 1 of argv)" \
-        -e "end run" \
-        -- "$ntitle" "$message" 2>/dev/null || true
-}
-
 # Build a short title from the first 80 chars of the message
 short_title=$(echo "$msg_text" | head -1 | cut -c1-80)
 
@@ -85,18 +76,18 @@ local_repo=$(_config_repo_path "$repo_name")
 reviews_dir="$(_reviews_dir)"
 work_dir=""
 
+# Create a branch name from the message
+branch_slug=$(echo "$msg_text" | head -1 | \
+    tr '[:upper:]' '[:lower:]' | \
+    sed 's/[^a-z0-9 ]//g' | \
+    tr ' ' '-' | \
+    cut -c1-40 | \
+    sed 's/-$//')
+[[ -z "$branch_slug" ]] && branch_slug="task-$(date +%s)"
+branch_name="slack/${branch_slug}"
+
 if [[ -n "$local_repo" ]] && [[ -d "${local_repo/#\~/$HOME}/.git" ]]; then
     local_repo="${local_repo/#\~/$HOME}"
-
-    # Create a branch name from the message
-    branch_slug=$(echo "$msg_text" | head -1 | \
-        tr '[:upper:]' '[:lower:]' | \
-        sed 's/[^a-z0-9 ]//g' | \
-        tr ' ' '-' | \
-        cut -c1-40 | \
-        sed 's/-$//')
-    [[ -z "$branch_slug" ]] && branch_slug="task-$(date +%s)"
-    branch_name="slack/${branch_slug}"
 
     # Create a worktree for the implementation
     work_dir="$reviews_dir/$repo_name/slack-${msg_key##*-}"
@@ -144,14 +135,6 @@ elif [[ -n "$target_repo" ]]; then
     fi
 
     if [[ -n "$work_dir" ]] && [[ -d "$work_dir/.git" ]]; then
-        branch_slug=$(echo "$msg_text" | head -1 | \
-            tr '[:upper:]' '[:lower:]' | \
-            sed 's/[^a-z0-9 ]//g' | \
-            tr ' ' '-' | \
-            cut -c1-40 | \
-            sed 's/-$//')
-        [[ -z "$branch_slug" ]] && branch_slug="task-$(date +%s)"
-        branch_name="slack/${branch_slug}"
         git -C "$work_dir" checkout -b "$branch_name" 2>>"$session_dir/clone-stderr.log" || {
             _log "ERROR: Failed to create branch $branch_name"
             _update_meta_status "$session_dir" "failed"
@@ -167,15 +150,7 @@ if [[ -z "$work_dir" ]]; then
     exit 1
 fi
 
-# Update meta with the working directory
-python3 -c "
-import json
-with open('$session_dir/meta.json', 'r') as f:
-    meta = json.load(f)
-meta['review_clone'] = '$work_dir'
-with open('$session_dir/meta.json', 'w') as f:
-    json.dump(meta, f, indent=2)
-"
+_update_meta_field "$session_dir" "review_clone" "$work_dir"
 
 # --- Build the implementation prompt ---
 implementation_prompt="You received this request from a Slack conversation:

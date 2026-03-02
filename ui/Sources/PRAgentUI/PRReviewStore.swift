@@ -30,13 +30,11 @@ class PRReviewStore: ObservableObject {
     }
 
     var activeReviews: [PRReview] {
-        let base = searchQuery.trimmingCharacters(in: .whitespaces).isEmpty ? reviews : filteredReviews
-        return base.filter { $0.status != .merged }
+        filteredReviews.filter { $0.status != .merged }
     }
 
     var mergedReviews: [PRReview] {
-        let base = searchQuery.trimmingCharacters(in: .whitespaces).isEmpty ? reviews : filteredReviews
-        return base.filter { $0.status == .merged }
+        filteredReviews.filter { $0.status == .merged }
     }
 
     var filteredReviews: [PRReview] {
@@ -84,7 +82,7 @@ class PRReviewStore: ObservableObject {
         timer?.invalidate()
     }
 
-    func loadReviews() {
+    private func loadReviews() {
         var loaded: [PRReview] = []
 
         guard let contents = try? FileManager.default.contentsOfDirectory(

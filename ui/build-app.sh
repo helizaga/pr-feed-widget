@@ -3,7 +3,6 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 APP_NAME="PR Agent"
-BUNDLE_ID="com.averyjennings.pr-agent-ui"
 APP_DIR="$SCRIPT_DIR/build/${APP_NAME}.app"
 
 echo "Building release..."

@@ -137,7 +137,7 @@ _fetch_repo_prs() {
 filtered_repos=()
 while IFS= read -r repo; do
     [[ -z "$repo" ]] && continue
-    [[ "$(_is_skip_repo "$repo")" == "yes" ]] && continue
+    [[ "$(_config_list_contains "skip_repos" "$repo")" == "yes" ]] && continue
     filtered_repos+=("$repo")
 done <<< "$repos_list"
 

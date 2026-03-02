@@ -18,7 +18,7 @@ Reviews run against your local repo clones via git worktrees, so Claude has full
 - macOS 14+
 - [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code) (`claude` in PATH)
 - [GitHub CLI](https://cli.github.com/) (`gh`) authenticated with your org
-- [iTerm2](https://iterm2.com/) (for interactive review sessions)
+- [iTerm2](https://iterm2.com/) (recommended — falls back to default terminal)
 - Swift 5.9+ / Xcode 15+ (for building the menu bar app)
 
 ## Install
@@ -69,6 +69,7 @@ The review prompt is fully customizable — edit it in the config file or from t
 | Variable | Replaced with |
 |---|---|
 | `{{repo}}` | Repository name |
+| `{{repo_full}}` | Full `org/repo` path |
 | `{{pr_num}}` | PR number |
 | `{{title}}` | PR title |
 | `{{author}}` | PR author |
@@ -129,6 +130,4 @@ Reviews create git worktrees from your local repo clones (configured in `repos:`
 
 ## Screenshots
 
-| Feed | Re-review |
-|---|---|
-| ![Feed](assets/screenshot-menu.png) | ![Re-review](assets/screenshot-rereviewing.png) |
+![Menu bar feed](assets/screenshot-menu.png)

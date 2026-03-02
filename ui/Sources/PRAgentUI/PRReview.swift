@@ -9,23 +9,13 @@ struct PRReview: Identifiable, Codable {
     let title: String
     let author: String
     let createdAt: String
-    var reviewStartedAt: String?
-    var reviewCompletedAt: String?
     var status: ReviewStatus
     var sessionId: String?
-    var pid: Int?
     var trigger: String?
     var priority: String?
     var reviewClone: String?
     var backend: String?
-    var sourceChannel: String?
-    var sourceMessage: String?
-    var mergedAt: String?
-    var mergeCheckedAt: String?
     var autoMode: Bool?
-    var autoPostedAt: String?
-    var autoLastChecked: String?
-    var autoResponseCount: Int?
 
     var id: String { prKey }
 
@@ -98,13 +88,10 @@ struct PRReview: Identifiable, Codable {
             for (value, weight) in fields {
                 let lower = value.lowercased()
                 if lower == token {
-                    // Exact match — full weight
                     bestFieldScore = max(bestFieldScore, weight)
                 } else if lower.hasPrefix(token) {
-                    // Prefix match — 80% weight
                     bestFieldScore = max(bestFieldScore, weight * 0.8)
                 } else if lower.contains(token) {
-                    // Substring match — 50% weight
                     bestFieldScore = max(bestFieldScore, weight * 0.5)
                 }
             }
@@ -115,10 +102,15 @@ struct PRReview: Identifiable, Codable {
         return totalScore
     }
 
+    private static let iso8601Fractional: ISO8601DateFormatter = {
+        let f = ISO8601DateFormatter()
+        f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return f
+    }()
+    private static let iso8601Plain = ISO8601DateFormatter()
+
     private func parseISO8601(_ string: String) -> Date? {
-        let formatter = ISO8601DateFormatter()
-        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        return formatter.date(from: string) ?? ISO8601DateFormatter().date(from: string)
+        Self.iso8601Fractional.date(from: string) ?? Self.iso8601Plain.date(from: string)
     }
 
     enum CodingKeys: String, CodingKey {
@@ -127,21 +119,12 @@ struct PRReview: Identifiable, Codable {
         case prNumber = "pr_number"
         case repo, org, title, author
         case createdAt = "created_at"
-        case reviewStartedAt = "review_started_at"
-        case reviewCompletedAt = "review_completed_at"
         case status
         case sessionId = "session_id"
-        case pid, trigger, priority
+        case trigger, priority
         case reviewClone = "review_clone"
         case backend
-        case sourceChannel = "source_channel"
-        case sourceMessage = "source_message"
-        case mergedAt = "merged_at"
-        case mergeCheckedAt = "merge_checked_at"
         case autoMode = "auto_mode"
-        case autoPostedAt = "auto_posted_at"
-        case autoLastChecked = "auto_last_checked"
-        case autoResponseCount = "auto_response_count"
     }
 }
 
