@@ -174,7 +174,7 @@ except:
     # Spawn the implementation review, then mark processed only on success
     _log "Spawning implementation agent for message $msg_key"
     "$PR_AGENT_DIR/bin/pr-agent-slack-review" "$msg_key" "$slack_channel" "$msg_text" "$author" "$target_repo" &
-    local spawn_pid=$!
+    spawn_pid=$!
     # Brief delay to let the process start (or fail immediately)
     sleep 0.1
     if kill -0 "$spawn_pid" 2>/dev/null; then

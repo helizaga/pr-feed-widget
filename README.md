@@ -55,9 +55,6 @@ repos:
 # Where review worktrees are created
 reviews_dir: ~/pr-reviews
 
-# Max PRs to fetch per poll (paginated, GitHub hard limit is 1000)
-max_reviews: 200
-
 # Max simultaneous Claude review processes
 max_concurrent_reviews: 2
 

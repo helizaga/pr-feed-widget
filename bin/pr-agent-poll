@@ -14,8 +14,6 @@ _log() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a "$LOG_FILE"
 }
 
-# _count_active_reviews is defined in lib-config.sh
-
 # Re-spawn a dead review session in the background
 _respawn_review() {
     local session_dir="$1"
@@ -186,10 +184,6 @@ while IFS='|' read -r pr_num repo_url title pr_url created_at author draft; do
     # Extract repo name from URL
     repo=$(echo "$repo_url" | sed 's|.*/||')
 
-    if [[ "$(_is_skip_repo "$repo")" == "yes" ]]; then
-        continue
-    fi
-
     # Skip draft PRs unless configured otherwise
     if [[ "$skip_drafts" == "true" ]] && [[ "$draft" == "true" ]]; then
         continue
@@ -210,8 +204,6 @@ done <<< "$prs"
 _log "Found $new_count new PRs"
 
 # Sort queued PRs newest-first by created_at (field 7)
-# This ensures recent PRs are reviewed first; new PRs from webhooks
-# naturally jump the queue since they'll have the most recent dates
 if (( ${#queued[@]} > 1 )); then
     sorted=$(printf '%s\n' "${queued[@]}" | sort -t'|' -k7 -r)
     queued=()
@@ -227,8 +219,6 @@ for entry in "${queued[@]+"${queued[@]}"}"; do
     IFS='|' read -r pr_key pr_url title repo pr_num author created_at <<< "$entry"
 
     # Wait until we're under the concurrency limit
-    # Uses _count_active_reviews to count ALL active reviews globally
-    # (including zombie re-spawns and webhook-triggered reviews)
     while true; do
         running=$(_count_active_reviews)
         if (( running < max_concurrent )); then

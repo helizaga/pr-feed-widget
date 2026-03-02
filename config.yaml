@@ -3,8 +3,7 @@ skip_repos:
   - test-repo
   - pr-reviewer_test
 
-# Local repo paths — used to create shallow clones for review
-# Format: repo_name: /absolute/path/to/local/clone
+# Local repo paths — used to create worktrees for review
 repos:
   mono: ~/work/mono
   website: ~/work/website
@@ -19,11 +18,11 @@ reviews_dir: ~/pr-reviews
 
 # Webhook server (alternative to polling for real-time PR notifications)
 webhook_port: 9867
-webhook_secret: ""  # GitHub webhook secret for signature verification
+webhook_secret: ""
 
 # Polling intervals (seconds)
-poll_interval_github: 300  # 5 minutes
-poll_interval_slack: 120   # 2 minutes
+poll_interval_github: 300
+poll_interval_slack: 120
 
 # Max concurrent review agents
 max_concurrent_reviews: 2
@@ -95,9 +94,6 @@ slack_poll_interval: 120       # seconds between polls
 slack_trigger_emoji: "rocket"  # React with this emoji to trigger implementation
 slack_target_repo: ""          # Default repo for implementations (e.g., owner/repo)
 
-# Slack notification settings
-notify: true
-
 # Auto-comment users: Claude will post review comments directly on the PR
 # for these authors, but will NOT approve. Approval is left to a human.
 auto_comment_users: []
@@ -105,8 +101,8 @@ auto_comment_users: []
 # Auto-mode: fully automated reviews for specific users
 # PRs from these authors get auto-posted comments and continuous monitoring
 auto_review_users: []
-auto_monitor_interval: 300         # seconds between re-checks (5 min)
-auto_max_responses: 10             # max auto-responses per PR to prevent runaway loops
+auto_monitor_interval: 300
+auto_max_responses: 10
 
 # How many days to keep completed sessions
 retention_days: 30

@@ -6,7 +6,6 @@ struct PRMenuView: View {
     @State private var showReviewRequested: Bool = false
     @State private var showMerged: Bool = false
     @State private var eventMonitor: Any?
-    // prompt editor opens as standalone NSPanel, not state-driven
 
     /// Whether the current search query looks like a PR reference (URL, #1234, repo#1234)
     private var queryIsReviewRef: Bool {
@@ -192,7 +191,7 @@ struct PRMenuView: View {
                             .foregroundStyle(.secondary)
                     }
                 } else {
-                    Button(action: { runPoll() }) {
+                    Button(action: { store.runPoll() }) {
                         Label("Poll Now", systemImage: "arrow.clockwise")
                             .font(.caption)
                     }
@@ -316,10 +315,6 @@ struct PRMenuView: View {
         }
     }
 
-    private func runPoll() {
-        store.runPoll()
-    }
-
     private func promptCustomEditor() {
         let alert = NSAlert()
         alert.messageText = "Custom IDE Command"
@@ -372,7 +367,6 @@ struct PRRowView: View {
     let review: PRReview
     @ObservedObject var store: PRReviewStore
     @State private var isHovering = false
-    // re-review opens as standalone NSPanel, not state-driven
 
     var body: some View {
         HStack(spacing: 8) {

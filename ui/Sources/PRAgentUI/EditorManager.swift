@@ -81,10 +81,6 @@ class EditorManager: ObservableObject {
         installedEditors = Self.registry.filter { $0.isInstalled }
     }
 
-    var hasEditor: Bool {
-        selectedEditorId != nil
-    }
-
     // MARK: - Config read/write
 
     func readEditorFromConfig() -> String? {

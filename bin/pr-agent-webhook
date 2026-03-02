@@ -627,7 +627,6 @@ class WebhookHandler(BaseHTTPRequestHandler):
             repo_org = data["repository"]["owner"]["login"]
             commenter = data["comment"]["user"]["login"]
             comment_body = data["comment"]["body"]
-            diff_hunk = data["comment"].get("diff_hunk", "")
             path = data["comment"].get("path", "")
         except (KeyError, TypeError) as e:
             log(f"ERROR parsing review comment event: missing field {e}")
@@ -662,8 +661,7 @@ def run_server():
     if not WEBHOOK_SECRET:
         warning = "WARNING: No webhook_secret configured — accepting unauthenticated requests."
         if WEBHOOK_HOST == "0.0.0.0":
-            warning += " Server is bound to 0.0.0.0 (LAN-exposed). Set webhook_host: 127.0.0.1 to restrict to localhost."
-        warning += " Set webhook_secret in config.yaml to secure this endpoint."
+            warning += " Server is bound to 0.0.0.0 (LAN-exposed). Set webhook_host: 127.0.0.1 to restrict."
         log(warning)
 
     def handle_term(signum, frame):

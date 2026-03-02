@@ -13,8 +13,4 @@ build/
 *.xcworkspace
 DerivedData/
 
-# Python
-__pycache__/
-*.pyc
-.venv/
 .claude/worktrees/

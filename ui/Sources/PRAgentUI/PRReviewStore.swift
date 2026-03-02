@@ -21,10 +21,6 @@ class PRReviewStore: ObservableObject {
         reviews.filter { $0.status == .ready || $0.status == .reviewing }.count
     }
 
-    var readyReviews: [PRReview] {
-        reviews.filter { $0.status == .ready }
-    }
-
     var reviewingReviews: [PRReview] {
         reviews.filter { $0.status == .reviewing }
     }
@@ -43,7 +39,6 @@ class PRReviewStore: ObservableObject {
         return base.filter { $0.status == .merged }
     }
 
-    /// Returns reviews filtered and ranked by search query
     var filteredReviews: [PRReview] {
         if searchQuery.trimmingCharacters(in: .whitespaces).isEmpty {
             return reviews
@@ -77,7 +72,6 @@ class PRReviewStore: ObservableObject {
             self?.objectWillChange.send()
         }
 
-        // Create directory if needed
         try? FileManager.default.createDirectory(at: sessionsDir, withIntermediateDirectories: true)
 
         loadReviews()
@@ -108,7 +102,6 @@ class PRReviewStore: ObservableObject {
             loaded.append(review)
         }
 
-        // Sort by date, most recent first
         loaded.sort { a, b in
             a.createdAt > b.createdAt
         }
@@ -119,7 +112,6 @@ class PRReviewStore: ObservableObject {
     }
 
     private func startWatching() {
-        // FSEvents via GCD dispatch source on the sessions directory
         let fd = open(sessionsDir.path, O_EVTONLY)
         guard fd >= 0 else { return }
 
@@ -130,7 +122,6 @@ class PRReviewStore: ObservableObject {
         )
 
         source.setEventHandler { [weak self] in
-            // Debounce: wait a beat for writes to finish
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
                 self?.loadReviews()
             }
@@ -165,7 +156,6 @@ class PRReviewStore: ObservableObject {
         }
     }
 
-    /// Launch a new terminal session for the review via .command file.
     /// Must be called from a background thread.
     private func launchNewSession(for review: PRReview) {
         let home = FileManager.default.homeDirectoryForCurrentUser.path
@@ -181,7 +171,6 @@ class PRReviewStore: ObservableObject {
 
         try? script.write(toFile: launcherPath, atomically: true, encoding: .utf8)
 
-        // Make executable and open in default terminal
         let chmod = Process()
         chmod.executableURL = URL(fileURLWithPath: "/bin/chmod")
         chmod.arguments = ["+x", launcherPath]
@@ -334,7 +323,6 @@ class PRReviewStore: ObservableObject {
     }
 
     func discardAll() {
-        // Clear UI instantly
         reviews = []
         DispatchQueue.global(qos: .userInitiated).async {
             let task = Process()
@@ -453,7 +441,6 @@ class PRReviewStore: ObservableObject {
 
     func freshReview(review: PRReview, extraPrompt: String) {
         DispatchQueue.global(qos: .userInitiated).async {
-            // Discard existing session and worktree
             let discard = Process()
             discard.executableURL = URL(fileURLWithPath: self.prAgentBin)
             discard.arguments = ["discard", review.prKey]
@@ -461,7 +448,6 @@ class PRReviewStore: ObservableObject {
             try? discard.run()
             discard.waitUntilExit()
 
-            // Write extra prompt into the (re-created) session dir before spawning review
             let sessionDir = self.sessionsDir.appendingPathComponent(review.prKey).path
             try? FileManager.default.createDirectory(atPath: sessionDir, withIntermediateDirectories: true)
             let trimmed = extraPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -469,7 +455,6 @@ class PRReviewStore: ObservableObject {
                 try? trimmed.write(toFile: "\(sessionDir)/extra-prompt.txt", atomically: true, encoding: .utf8)
             }
 
-            // Spawn fresh review using pr-agent-review directly with the saved fields
             let fresh = Process()
             fresh.executableURL = URL(fileURLWithPath: "\(self.prAgentDir)/bin/pr-agent-review")
             fresh.arguments = [
@@ -505,9 +490,7 @@ class PRReviewStore: ObservableObject {
     }
 
     func stopAutoMode(for review: PRReview) {
-        // Kill the auto-monitor process if running
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            // Find and kill pr-agent-auto processes for this pr_key
             let task = Process()
             task.executableURL = URL(fileURLWithPath: "/usr/bin/pkill")
             // Anchor the pattern to avoid matching unrelated processes

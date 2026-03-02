@@ -167,22 +167,17 @@ full_prompt="${full_prompt//\{\{extra_instructions\}\}/$extra_instructions}"
 
 _log "Running $review_backend review from $review_worktree"
 
-# Generate a unique session ID (uuid5 from pr_key + timestamp to avoid collisions on re-reviews)
 session_id=$(python3 -c "import uuid, time; print(uuid.uuid5(uuid.NAMESPACE_DNS, '$pr_key-' + str(int(time.time()))))")
 
 # Write summary.md so the Claude session monitor shows a readable name instead of a UUID
-_write_session_title() {
-    local project_path
-    project_path=$(echo "$review_worktree" | sed "s|^/||" | sed "s|/|-|g")
-    local summary_dir="$HOME/.claude/projects/-${project_path}/${session_id}/session-memory"
-    mkdir -p "$summary_dir"
-    cat > "$summary_dir/summary.md" << SUMMARY_EOF
+project_path=$(echo "$review_worktree" | sed "s|^/||" | sed "s|/|-|g")
+summary_dir="$HOME/.claude/projects/-${project_path}/${session_id}/session-memory"
+mkdir -p "$summary_dir"
+cat > "$summary_dir/summary.md" << SUMMARY_EOF
 # Session Title
 
 Review: ${repo}#${pr_num} — ${title}
 SUMMARY_EOF
-}
-_write_session_title
 
 # Persist session_id and review_clone to meta.json now so they're available for resume during review
 _update_meta_field "$session_dir" "session_id" "$session_id"
@@ -274,12 +269,6 @@ esac
 if $review_succeeded; then
     _log "Review complete (backend: $review_backend)"
 
-    # Determine if this backend supports session resume
-    resumable="true"
-    if [[ "$review_backend" != "claude" ]]; then
-        resumable="false"
-    fi
-
     # Set status based on auto_mode
     review_status="ready"
     if [[ "$auto_mode" == "true" ]]; then
@@ -293,7 +282,7 @@ with open('$session_dir/meta.json', 'r') as f:
     meta = json.load(f)
 meta['status'] = '$review_status'
 meta['session_id'] = '$session_id'
-meta['resumable'] = '$resumable' == 'true'
+meta['resumable'] = '$review_backend' == 'claude'
 meta['pid'] = None
 meta['review_completed_at'] = datetime.now(timezone.utc).isoformat()
 meta['review_clone'] = '$review_worktree'

@@ -1,4 +1,3 @@
-import Foundation
 import SwiftUI
 
 struct PRReview: Identifiable, Codable {
@@ -30,12 +29,10 @@ struct PRReview: Identifiable, Codable {
 
     var id: String { prKey }
 
-    /// The review backend used, defaulting to "claude"
     var effectiveBackend: String {
         backend ?? "claude"
     }
 
-    /// Whether this review's session can be resumed interactively
     var isResumable: Bool {
         effectiveBackend == "claude"
     }

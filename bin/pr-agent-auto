@@ -16,18 +16,13 @@ _log() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] [auto:${pr_key}] $*" | tee -a "$LOG_FILE"
 }
 
-# Read meta fields
-_read_meta() {
-    _meta_field "$session_dir" "$1" 2>/dev/null || echo ""
-}
-
-pr_url=$(_read_meta "pr_url")
-session_id=$(_read_meta "session_id")
-repo=$(_read_meta "repo")
-pr_num=$(_read_meta "pr_number")
-org=$(_read_meta "org")
-review_clone=$(_read_meta "review_clone")
-backend=$(_read_meta "backend")
+pr_url=$(_meta_field "$session_dir" "pr_url" 2>/dev/null || echo "")
+session_id=$(_meta_field "$session_dir" "session_id" 2>/dev/null || echo "")
+repo=$(_meta_field "$session_dir" "repo" 2>/dev/null || echo "")
+pr_num=$(_meta_field "$session_dir" "pr_number" 2>/dev/null || echo "")
+org=$(_meta_field "$session_dir" "org" 2>/dev/null || echo "")
+review_clone=$(_meta_field "$session_dir" "review_clone" 2>/dev/null || echo "")
+backend=$(_meta_field "$session_dir" "backend" 2>/dev/null || echo "")
 
 monitor_interval=$(_config_value "auto_monitor_interval")
 monitor_interval="${monitor_interval:-300}"
@@ -54,25 +49,16 @@ last_check_time=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 while true; do
     sleep "$monitor_interval"
 
-    # Check if PR is merged or closed (single API call)
-    pr_info=$(gh api "repos/${org}/${repo}/pulls/${pr_num}" --jq '{state,merged}' 2>/dev/null || echo '{"state":"open","merged":false}')
+    pr_info=$(gh api "repos/${org}/${repo}/pulls/${pr_num}" --jq '{state,merged,merged_at}' 2>/dev/null || echo '{"state":"open","merged":false}')
     pr_state=$(echo "$pr_info" | python3 -c "import json,sys; print(json.load(sys.stdin).get('state','open'))")
     pr_merged=$(echo "$pr_info" | python3 -c "import json,sys; print(str(json.load(sys.stdin).get('merged',False)).lower())")
 
     if [[ "$pr_merged" == "true" ]]; then
         _log "PR merged — stopping monitor"
         _update_meta_status "$session_dir" "merged"
-        # Write merged_at (fetch from same endpoint, but we need the full field)
-        merged_at=$(gh api "repos/${org}/${repo}/pulls/${pr_num}" --jq '.merged_at // empty' 2>/dev/null || echo "")
+        merged_at=$(echo "$pr_info" | python3 -c "import json,sys; print(json.load(sys.stdin).get('merged_at',''))" 2>/dev/null || echo "")
         if [[ -n "$merged_at" ]]; then
-            python3 -c "
-import json
-with open('$session_dir/meta.json', 'r') as f:
-    meta = json.load(f)
-meta['merged_at'] = '$merged_at'
-with open('$session_dir/meta.json', 'w') as f:
-    json.dump(meta, f, indent=2)
-"
+            _update_meta_field "$session_dir" "merged_at" "$merged_at"
         fi
         exit 0
     fi
@@ -90,27 +76,14 @@ with open('$session_dir/meta.json', 'w') as f:
         exit 0
     fi
 
-    # Capture poll start time BEFORE fetching to avoid missing comments
-    # created between the fetch snapshot and timestamp assignment
+    # Capture poll start time BEFORE fetching to avoid missing comments between fetch and timestamp update
     poll_started=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 
-    # Fetch new human comments, excluding the bot's own identity to prevent recursion
     bot_login=$(gh api user --jq '.login' 2>/dev/null || echo "")
     new_comments=$(gh api "repos/${org}/${repo}/issues/${pr_num}/comments?since=${last_check_time}" \
         --jq '[.[] | select(.user.login != "coderabbitai[bot]" and (.user.type // "User") != "Bot" and .user.login != "'"${bot_login}"'") | {user: .user.login, body: .body, created_at: .created_at}]' 2>/dev/null || echo "[]")
 
     last_check_time="$poll_started"
-
-    # Update auto_last_checked in meta
-    python3 -c "
-import json
-from datetime import datetime, timezone
-with open('$session_dir/meta.json', 'r') as f:
-    meta = json.load(f)
-meta['auto_last_checked'] = datetime.now(timezone.utc).isoformat()
-with open('$session_dir/meta.json', 'w') as f:
-    json.dump(meta, f, indent=2)
-"
 
     comment_count=$(echo "$new_comments" | python3 -c "import json,sys; print(len(json.load(sys.stdin)))" 2>/dev/null || echo "0")
 

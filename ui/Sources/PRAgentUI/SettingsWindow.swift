@@ -371,13 +371,8 @@ private struct SettingsContent: View {
     private func save() {
         guard var content = try? String(contentsOfFile: configPath, encoding: .utf8) else { return }
 
-        // Update skip_repos
         content = replaceYamlList(in: content, key: "skip_repos", values: skippedRepos.sorted())
-
-        // Update auto_comment_users
         content = replaceYamlList(in: content, key: "auto_comment_users", values: autoCommentUsers.sorted())
-
-        // Update max_concurrent_reviews
         content = replaceYamlScalar(in: content, key: "max_concurrent_reviews", value: "\(maxConcurrentReviews)")
 
         do {
