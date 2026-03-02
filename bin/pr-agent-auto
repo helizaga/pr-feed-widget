@@ -125,29 +125,33 @@ for c in comments:
 
 Please review these new comments and respond appropriately. If they raise valid concerns, update your review. If they ask questions, answer them. Output any new comments you'd like to post in the same structured format as before."
 
+    post_succeeded=false
+
     # Only Claude backend supports session resume
-    if [[ "$backend" == "claude" ]] && [[ -n "$session_id" ]]; then
+    if [[ "$backend" == "claude" ]] && [[ -n "$session_id" ]] && [[ "$session_id" != "None" ]]; then
         local_dir="${review_clone:-.}"
         if [[ ! -d "$local_dir" ]]; then
             _log "review_clone '$local_dir' is inaccessible — skipping response"
             _update_meta_status "$session_dir" "auto-monitoring"
             continue
         fi
-        if cd "$local_dir" 2>/dev/null; then
-            env -u CLAUDECODE claude \
-                --resume "$session_id" \
-                -p "$response_prompt" \
-                --permission-mode "bypassPermissions" \
-                > "$session_dir/response-${response_count}.md" \
-                2>>"$session_dir/claude-stderr.log" || {
-                _log "Response failed"
-                _update_meta_status "$session_dir" "auto-monitoring"
-                continue
-            }
+        if ! cd "$local_dir" 2>/dev/null; then
+            _log "Cannot cd to review_clone ($local_dir) — skipping response"
+            _update_meta_status "$session_dir" "auto-monitoring"
+            continue
         fi
+        env -u CLAUDECODE claude \
+            --resume "$session_id" \
+            -p "$response_prompt" \
+            --permission-mode "bypassPermissions" \
+            > "$session_dir/response-${response_count}.md" \
+            2>>"$session_dir/claude-stderr.log" || {
+            _log "Response failed"
+            _update_meta_status "$session_dir" "auto-monitoring"
+            continue
+        }
 
         # Auto-post the response
-        post_succeeded=false
         if [[ -f "$session_dir/response-${response_count}.md" ]]; then
             if gh pr comment "$pr_url" --body-file "$session_dir/response-${response_count}.md" 2>/dev/null; then
                 post_succeeded=true
@@ -171,7 +175,7 @@ with open('$session_dir/meta.json', 'w') as f:
     json.dump(meta, f, indent=2)
 "
 
-    if $post_succeeded; then
+    if [[ "$post_succeeded" == "true" ]]; then
         _log "Response $response_count posted, back to monitoring"
     fi
 done

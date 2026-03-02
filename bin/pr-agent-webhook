@@ -59,6 +59,14 @@ LOG_FILE = sys.argv[8]
 PID_FILE = sys.argv[9]
 WEBHOOK_HOST = sys.argv[10] if len(sys.argv) > 10 else "127.0.0.1"
 
+# Fetch the authenticated user's login once at startup to filter out self-comments
+try:
+    _result = subprocess.run(["gh", "api", "user", "--jq", ".login"],
+                             capture_output=True, text=True, timeout=10)
+    SELF_LOGIN = _result.stdout.strip() if _result.returncode == 0 else ""
+except Exception:
+    SELF_LOGIN = ""
+
 # Locks for thread-safe file access
 _state_lock = Lock()          # guards state.json reads/writes
 _pr_locks = {}                # per-PR-key locks for meta.json
@@ -109,21 +117,30 @@ def mark_seen(pr_key):
 def is_skip_repo(repo):
     config_file = os.path.join(PR_AGENT_HOME, "config.yaml")
     try:
-        in_skip = False
+        import yaml
         with open(config_file) as f:
-            for line in f:
-                if line.startswith("skip_repos:"):
-                    in_skip = True
-                    continue
-                if in_skip:
-                    if line.startswith("  - "):
-                        if line.strip().lstrip("- ").strip() == repo:
-                            return True
-                    elif not line.startswith(" "):
-                        break
+            config = yaml.safe_load(f)
+        return repo in (config.get("skip_repos") or [])
+    except ImportError:
+        # pyyaml not installed — fall back to manual parsing
+        try:
+            in_skip = False
+            with open(config_file) as f:
+                for line in f:
+                    if line.startswith("skip_repos:"):
+                        in_skip = True
+                        continue
+                    if in_skip:
+                        if line.startswith("  - "):
+                            if line.strip().lstrip("- ").strip() == repo:
+                                return True
+                        elif not line.startswith(" "):
+                            break
+        except Exception:
+            pass
+        return False
     except Exception:
-        pass
-    return False
+        return False
 
 
 def verify_signature(payload, signature):
@@ -220,8 +237,8 @@ def resume_session(pr_key, reason, details):
         review_clone = meta.get("review_clone")
         status = meta.get("status", "")
 
-        # Only resume completed reviews — lock ensures no race with concurrent events
-        if status not in ("ready", "posted", "in-progress"):
+        # Only resume completed or dismissed reviews — lock ensures no race with concurrent events
+        if status not in ("ready", "posted", "in-progress", "dismissed"):
             log(f"Skipping resume for {pr_key}: status is '{status}'")
             return
 
@@ -525,9 +542,9 @@ class WebhookHandler(BaseHTTPRequestHandler):
         if is_skip_repo(repo):
             return
 
-        # Ignore bot comments (CodeRabbit, github-actions, etc.)
-        if "[bot]" in comment_author:
-            log(f"Ignoring bot comment from {comment_author} on {repo}#{pr_num}")
+        # Ignore bot comments and the agent's own comments
+        if "[bot]" in comment_author or (SELF_LOGIN and comment_author == SELF_LOGIN):
+            log(f"Ignoring bot/self comment from {comment_author} on {repo}#{pr_num}")
             return
 
         pr_key = f"{ORG}-{repo}-{pr_num}"
@@ -565,7 +582,7 @@ class WebhookHandler(BaseHTTPRequestHandler):
 
         if repo_org != ORG:
             return
-        if "[bot]" in reviewer:
+        if "[bot]" in reviewer or (SELF_LOGIN and reviewer == SELF_LOGIN):
             return
 
         pr_key = f"{ORG}-{repo}-{pr_num}"
@@ -604,7 +621,7 @@ class WebhookHandler(BaseHTTPRequestHandler):
 
         if repo_org != ORG:
             return
-        if "[bot]" in commenter:
+        if "[bot]" in commenter or (SELF_LOGIN and commenter == SELF_LOGIN):
             return
 
         pr_key = f"{ORG}-{repo}-{pr_num}"

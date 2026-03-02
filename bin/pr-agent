@@ -136,7 +136,7 @@ cmd_open() {
     if [[ -n "$review_clone" ]] && [[ -d "$review_clone" ]]; then
         work_dir="$review_clone"
     else
-        echo "Error: review directory '$review_clone' is missing. Re-run: pr-agent review $ref"
+        echo "Error: review directory '$review_clone' is missing. Re-run: pr-agent review $pr_ref"
         return 1
     fi
 
@@ -543,6 +543,14 @@ cmd_discard() {
     reviews_dir=$(_reviews_dir)
 
     if [[ "$target" == "all" ]]; then
+        # Confirm destructive action when running interactively
+        local count
+        count=$(find "$SESSIONS_DIR" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l | tr -d ' ')
+        if [[ -t 0 ]] && [[ "$count" -gt 0 ]]; then
+            read -p "Discard all $count sessions? This cannot be undone. [y/N] " confirm
+            [[ "$confirm" =~ ^[Yy]$ ]] || { echo "Aborted."; return 0; }
+        fi
+
         # Kill any running review and auto-monitor processes
         pkill -f "pr-agent-review" 2>/dev/null || true
         pkill -f "pr-agent-poll" 2>/dev/null || true
@@ -551,8 +559,6 @@ cmd_discard() {
 
         # Reset state + nuke sessions in one shot (no per-session worktree cleanup)
         echo '{"seen_prs": {}, "last_poll": null}' > "$STATE_FILE"
-        local count
-        count=$(find "$SESSIONS_DIR" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l | tr -d ' ')
         rm -rf "$SESSIONS_DIR"
         mkdir -p "$SESSIONS_DIR"
 

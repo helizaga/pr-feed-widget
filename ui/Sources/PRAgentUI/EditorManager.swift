@@ -166,7 +166,7 @@ class EditorManager: ObservableObject {
     private func openInTerminal(command: String, path: String) {
         // Use a .command file to avoid AppleScript and TCC permission dialogs
         // Use a unique temp file to avoid race conditions with concurrent launches
-        let launcherPath = NSTemporaryDirectory() + "pr-agent-editor-\(ProcessInfo.processInfo.processIdentifier).command"
+        let launcherPath = NSTemporaryDirectory() + "pr-agent-editor-\(UUID().uuidString).command"
         // Shell-escape command and path to prevent injection
         let safeCommand = command.replacingOccurrences(of: "'", with: "'\\''")
         let safePath = path.replacingOccurrences(of: "'", with: "'\\''")

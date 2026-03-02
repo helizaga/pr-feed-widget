@@ -19,12 +19,6 @@ if ! command -v claude &>/dev/null; then
     done
 fi
 
-CLAUDE_BIN=$(command -v claude 2>/dev/null || true)
-if [[ -z "$CLAUDE_BIN" ]]; then
-    echo "Error: claude CLI not found on PATH" >&2
-    exit 1
-fi
-
 pr_key="$1"
 pr_url="$2"
 title="$3"
@@ -35,7 +29,7 @@ created_at="$7"
 
 session_dir="$SESSIONS_DIR/$pr_key"
 reviews_dir="$(_reviews_dir)"
-org=$(echo "$pr_key" | cut -d- -f1)
+org=$(echo "$pr_url" | sed -E 's|https://github.com/([^/]+)/.*|\1|')
 mkdir -p "$session_dir" "$reviews_dir"
 
 _log() {
@@ -71,7 +65,7 @@ meta = {
     'pr_url': '$pr_url',
     'pr_number': $pr_num,
     'repo': '$repo',
-    'org': '$(echo "$pr_key" | cut -d- -f1)',
+    'org': '$org',
     'title': title_val,
     'author': '$author',
     'created_at': '$created_at',
@@ -238,6 +232,16 @@ _run_custom_review() {
 }
 
 # Run the appropriate backend
+# Validate Claude CLI is available when needed
+if [[ "$review_backend" == "claude" ]]; then
+    CLAUDE_BIN=$(command -v claude 2>/dev/null || true)
+    if [[ -z "$CLAUDE_BIN" ]]; then
+        echo "Error: claude CLI not found on PATH" >&2
+        _update_meta_status "$session_dir" "failed"
+        exit 1
+    fi
+fi
+
 review_succeeded=false
 case "$review_backend" in
     claude)
@@ -299,17 +303,25 @@ with open('$session_dir/meta.json', 'w') as f:
 
         if [[ -f "$session_dir/comments.json" ]]; then
             python3 -c "
-import json, subprocess
+import json, subprocess, sys
 with open('$session_dir/comments.json') as f:
     comments = json.load(f)
+failed = 0
 for c in comments:
     body = c.get('body', '')
     path = c.get('path', '')
     line = c.get('line', '')
     if path and line:
         body = f'**{path}:{line}**\n\n{body}'
-    subprocess.run(['gh', 'pr', 'comment', '$pr_url', '--body', body], check=True)
-"
+    result = subprocess.run(['gh', 'pr', 'comment', '$pr_url', '--body', body])
+    if result.returncode != 0:
+        print(f'Failed to post comment: exit {result.returncode}', file=sys.stderr)
+        failed += 1
+if failed:
+    print(f'{failed} of {len(comments)} comment(s) failed to post', file=sys.stderr)
+" || {
+                _log "Auto-post had failures, continuing to start monitor"
+            }
         else
             _log "Auto-mode: no comments.json found, skipping auto-post (review.md contains raw output not suitable for posting)"
         fi
